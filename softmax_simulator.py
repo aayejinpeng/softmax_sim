@@ -52,6 +52,9 @@ class ProcessorConfig:
 
     # Issue width (max μops per cycle)
     issue_width: int = 2
+
+    # Number of hardware contexts (register groups)
+    num_contexts: int = 1
     
     def __post_init__(self):
         # Check that all compute unit widths don't exceed register width
@@ -89,11 +92,14 @@ class Instruction:
     dependencies: Set[int]  # IDs of instructions this depends on
     data_size: int  # Size of data to process (in bytes)
     target_register: Optional[int] = None
-    
+
     # Chaining support
     element_wise_src: bool = False
     element_wise_dest: bool = False
-    
+
+    # Context (register group) this instruction belongs to
+    context_id: int = 0
+
     # Execution state
     issued: bool = False
     started: bool = False
@@ -214,7 +220,7 @@ class StoreInstruction:
         return getattr(self.instruction, name)
 
 
-@dataclass 
+@dataclass
 class MicroOp:
     """Represents a micro-operation (uop) - a unit of work that can be executed"""
     instruction_id: int
@@ -223,7 +229,10 @@ class MicroOp:
     data_size: int  # Size of data this uop processes
     dependencies: Set[int]  # Other uops this depends on
     latency: int
-    
+
+    # Context this uop belongs to
+    context_id: int = 0
+
     # Execution state
     issued: bool = False
     started: bool = False
@@ -245,14 +254,17 @@ class InstructionExecutor:
     def split_instruction_to_uops(self, instruction: Instruction) -> List[MicroOp]:
         """Split an instruction into micro-operations based on processor configuration"""
         uops = []
-        
+
         if instruction.type == InstructionType.REDUCE:
             uops = self._split_reduce_instruction(instruction)
         elif instruction.type in [InstructionType.FMA, InstructionType.EXP2]:
             uops = self._split_arithmetic_instruction(instruction)
         elif instruction.type in [InstructionType.LOAD, InstructionType.STORE]:
             uops = self._split_memory_instruction(instruction)
-        
+
+        for uop in uops:
+            uop.context_id = instruction.context_id
+
         return uops
     
     def _split_reduce_instruction(self, instruction: Instruction) -> List[MicroOp]:
@@ -674,42 +686,58 @@ class VectorProcessor:
                 self.execution_units[inst_type].remove(uop_info)
     
     def _issue_in_order(self):
-        """Issue uops in order"""
+        """Issue uops in order, per context, with shared bandwidth"""
         simulated_window_size = 10
-        issued_count = 0
-        incompleted_uop_count = 0
-        for uop in self.uops:
-            if not uop.issued and self._can_issue_uop(uop):
-                if self._issue_uop(uop):
-                    issued_count += 1
-                    if issued_count >= self.config.issue_width:
-                        break
-            if not uop.completed:
-                incompleted_uop_count += 1
-            if incompleted_uop_count >= simulated_window_size:
-                break
-    
+        total_issued = 0
+        for ctx in range(self.config.num_contexts):
+            issued_count = 0
+            incompleted_uop_count = 0
+            for uop in self.uops:
+                if uop.context_id != ctx:
+                    continue
+                if not uop.issued and self._can_issue_uop(uop):
+                    if self._issue_uop(uop):
+                        total_issued += 1
+                        issued_count += 1
+                        if total_issued >= self.config.issue_width:
+                            return
+                if not uop.completed:
+                    incompleted_uop_count += 1
+                if incompleted_uop_count >= simulated_window_size:
+                    break
+
     def _issue_out_of_order(self):
-        """Issue uops out of order within a window"""
-        issued_count = 0
+        """Issue uops out of order within a window, per context, with shared bandwidth"""
+        total_issued = 0
         window_size = min(self.config.ooo_window_size, len(self.uops))
-        
-        # Find the first unissued instruction
-        first_unissued = 0
-        while (first_unissued < len(self.uops) and 
-               self.uops[first_unissued].issued):
-            first_unissued += 1
-        
-        # Look within the window for issuable uops
-        window_end = min(first_unissued + window_size, len(self.uops))
-        
-        for i in range(first_unissued, window_end):
-            uop = self.uops[i]
-            if not uop.issued and self._can_issue_uop(uop):
-                if self._issue_uop(uop):
-                    issued_count += 1
-                    if issued_count >= self.config.issue_width:
-                        break
+
+        for ctx in range(self.config.num_contexts):
+            issued_count = 0
+            # Find the first unissued uop in this context
+            first_unissued = 0
+            ctx_uop_indices = [i for i, u in enumerate(self.uops) if u.context_id == ctx]
+            if not ctx_uop_indices:
+                continue
+
+            first_unissued = 0
+            while (first_unissued < len(ctx_uop_indices) and
+                   self.uops[ctx_uop_indices[first_unissued]].issued):
+                first_unissued += 1
+
+            if first_unissued >= len(ctx_uop_indices):
+                continue
+
+            # Look within the window for issuable uops
+            window_end = min(first_unissued + window_size, len(ctx_uop_indices))
+
+            for idx in range(first_unissued, window_end):
+                uop = self.uops[ctx_uop_indices[idx]]
+                if not uop.issued and self._can_issue_uop(uop):
+                    if self._issue_uop(uop):
+                        total_issued += 1
+                        issued_count += 1
+                        if total_issued >= self.config.issue_width:
+                            return
     
     def _can_issue_uop(self, uop: MicroOp) -> bool:
         """Check if a uop can be issued"""
@@ -1022,7 +1050,7 @@ class VectorProcessor:
                   f"{issue_pct:6.1f}%")
 
 
-def create_softmax_instruction_stream(reg_width, has_exp2_unit, num_heads, seq_chunk_bit) -> List[Instruction]:
+def create_softmax_instruction_stream(reg_width, has_exp2_unit, num_heads, seq_chunk_bit, num_contexts=1) -> List[Instruction]:
     """Create a sample instruction stream for softmax computation"""
     # Use custom data size (1024 bytes) for this example to maintain compatibility
     # with existing simulation, override the default 256 bytes
@@ -1116,6 +1144,11 @@ def create_softmax_instruction_stream(reg_width, has_exp2_unit, num_heads, seq_c
                 # Store result
                 StoreInstruction(id=dep_group_id + 13, source_registers=[dep_group_id + 12], data_size=reg_width)
             ]
+
+        # Assign context (register group) for this head
+        ctx = h % num_contexts
+        for wrapper in per_head_insts:
+            wrapper.instruction.context_id = ctx
 
         all_insts.extend(per_head_insts)
     
@@ -1229,6 +1262,13 @@ def parse_arguments():
     )
 
     parser.add_argument(
+        "--num-contexts",
+        type=int,
+        default=1,
+        help="Number of hardware contexts (register groups), heads are round-robin assigned"
+    )
+
+    parser.add_argument(
         "--quiet",
         action="store_true",
         help="Only output total cycle count"
@@ -1265,7 +1305,8 @@ def main():
         chaining_granularity=64,  # Keep default granularity
         execution_mode=execution_mode,
         ooo_window_size=args.ooo_window_size,
-        issue_width=args.issue_width
+        issue_width=args.issue_width,
+        num_contexts=args.num_contexts
     )
     
     quiet = args.quiet
@@ -1289,7 +1330,7 @@ def main():
     processor = VectorProcessor(config, quiet=quiet)
 
     # Load sample softmax instruction stream
-    instructions = create_softmax_instruction_stream(args.register_width, args.exp2_unit, args.num_heads, args.seq_chunk_bits)
+    instructions = create_softmax_instruction_stream(args.register_width, args.exp2_unit, args.num_heads, args.seq_chunk_bits, num_contexts=args.num_contexts)
     processor.load_instructions(instructions)
 
     if not quiet:
