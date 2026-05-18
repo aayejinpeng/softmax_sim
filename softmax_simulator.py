@@ -235,8 +235,9 @@ class MicroOp:
 class InstructionExecutor:
     """Handles the execution logic for different instruction types"""
     
-    def __init__(self, config: ProcessorConfig):
+    def __init__(self, config: ProcessorConfig, quiet: bool = False):
         self.config = config
+        self.quiet = quiet
     
     def split_instruction_to_uops(self, instruction: Instruction) -> List[MicroOp]:
         """Split an instruction into micro-operations based on processor configuration"""
@@ -371,9 +372,10 @@ class InstructionExecutor:
         bytes_per_cycle = self.config.cache_bandwidth
         actual_bytes = instruction.data_size // 8
 
-        print(f"Max bytes per instruction: {max_bytes_per_instruction}")
-        print(f"Bytes per cycle: {bytes_per_cycle}")
-        print(f"Instruction data bytes: {actual_bytes}")
+        if not self.quiet:
+            print(f"Max bytes per instruction: {max_bytes_per_instruction}")
+            print(f"Bytes per cycle: {bytes_per_cycle}")
+            print(f"Instruction data bytes: {actual_bytes}")
 
         assert actual_bytes <= max_bytes_per_instruction
         
@@ -410,9 +412,10 @@ class InstructionExecutor:
 class VectorProcessor:
     """Main vector processor simulator"""
     
-    def __init__(self, config: ProcessorConfig):
+    def __init__(self, config: ProcessorConfig, quiet: bool = False):
         self.config = config
-        self.executor = InstructionExecutor(config)
+        self.quiet = quiet
+        self.executor = InstructionExecutor(config, quiet=quiet)
         
         # Simulation state
         self.current_cycle = 0
@@ -440,6 +443,10 @@ class VectorProcessor:
         # Outstanding (issued but not completed) counts tracking
         self.outstanding_instruction_count = 0
         self.outstanding_uop_count = 0
+
+        # Per-cycle utilization tracking
+        self.per_cycle_stats = []
+        self._cycle_issued_count = 0
     
     def load_instructions(self, instructions: List[Instruction]):
         """Load instruction stream into the processor"""
@@ -563,15 +570,18 @@ class VectorProcessor:
                             break
                 
                 # Establish one-to-one chaining dependencies
-                print(f"Establishing chaining between instruction {producer_inst.id} -> {consumer_inst.id}")
+                if not self.quiet:
+                    print(f"Establishing chaining between instruction {producer_inst.id} -> {consumer_inst.id}")
                 for i, (prod_uop_id, cons_uop_id) in enumerate(zip(producer_uop_ids, consumer_uop_ids)):
                     # Consumer uop depends on corresponding producer uop completion
                     self.uops[cons_uop_id].dependencies.add(prod_uop_id)
-                    print(f"  uop {consumer_inst.id}.{i} now depends on uop {producer_inst.id}.{i}")
-                
+                    if not self.quiet:
+                        print(f"  uop {consumer_inst.id}.{i} now depends on uop {producer_inst.id}.{i}")
+
                 # Remove instruction-level dependency since we now have uop-level dependencies
                 consumer_inst.dependencies.discard(producer_inst.id)
-                print(f"  Removed instruction-level dependency {producer_inst.id} -> {consumer_inst.id}")
+                if not self.quiet:
+                    print(f"  Removed instruction-level dependency {producer_inst.id} -> {consumer_inst.id}")
     
     def simulate(self, max_cycles: int = 10000) -> Dict:
         """Run the simulation and return results"""
@@ -590,12 +600,15 @@ class VectorProcessor:
         # Reset outstanding counts
         self.outstanding_instruction_count = 0
         self.outstanding_uop_count = 0
+
+        # Reset utilization stats
+        self.per_cycle_stats = []
         
         while not self._all_instructions_completed() and self.current_cycle < max_cycles:
             self._simulate_cycle()
             self.current_cycle += 1
         
-        if self.current_cycle >= max_cycles:
+        if self.current_cycle >= max_cycles and not self.quiet:
             print(f"Warning: Simulation reached maximum cycles ({max_cycles})")
             print(f"Completed instructions: {sum(1 for inst in self.instructions.values() if inst.completed)}/{len(self.instructions)}")
             print(f"Completed uops: {sum(1 for uop in self.uops if uop.completed)}/{len(self.uops)}")
@@ -609,6 +622,7 @@ class VectorProcessor:
         self.reduce_bandwidth_used = 0
         self.simple_elementwise_bandwidth_used = 0
         self.complex_elementwise_bandwidth_used = 0
+        self._cycle_issued_count = 0
         
         # Update execution units and complete uops
         self._update_execution_units()
@@ -622,6 +636,19 @@ class VectorProcessor:
         # Handle chaining if enabled
         if self.config.chaining_enabled:
             self._handle_chaining()
+
+        # Record per-cycle utilization stats
+        active_by_type = {}
+        for inst_type in self.execution_units:
+            active_by_type[inst_type] = len(self.execution_units[inst_type])
+        self.per_cycle_stats.append({
+            'issued_count': self._cycle_issued_count,
+            'active_by_type': active_by_type,
+            'cache_bw_used': self.cache_bandwidth_used,
+            'reduce_bw_used': self.reduce_bandwidth_used,
+            'simple_ew_bw_used': self.simple_elementwise_bandwidth_used,
+            'complex_ew_bw_used': self.complex_elementwise_bandwidth_used,
+        })
     
     def _update_execution_units(self):
         """Update execution units and complete finished uops"""
@@ -646,11 +673,15 @@ class VectorProcessor:
     def _issue_in_order(self):
         """Issue uops in order"""
         simulated_window_size = 10
+        issue_limit = 2
+        issued_count = 0
         incompleted_uop_count = 0
         for uop in self.uops:
             if not uop.issued and self._can_issue_uop(uop):
                 if self._issue_uop(uop):
-                    break
+                    issued_count += 1
+                    if issued_count >= issue_limit:
+                        break
             if not uop.completed:
                 incompleted_uop_count += 1
             if incompleted_uop_count >= simulated_window_size:
@@ -733,7 +764,10 @@ class VectorProcessor:
         
         # Update outstanding uop count
         self.outstanding_uop_count += 1
-        
+
+        # Track issued count for utilization
+        self._cycle_issued_count += 1
+
         return True
     
     def _handle_chaining(self):
@@ -751,7 +785,7 @@ class VectorProcessor:
                 uop.ready_elements = int(progress * elements_total)
                 
                 # For demonstration, print chaining progress
-                if cycles_elapsed == 1:  # Only print once per uop
+                if cycles_elapsed == 1 and not self.quiet:  # Only print once per uop
                     producer_inst = self.instructions[uop.instruction_id]
                     if producer_inst.element_wise_dest:
                         print(f"Chaining: uop {uop.instruction_id}.{uop.uop_id} has "
@@ -922,6 +956,68 @@ class VectorProcessor:
         
         print()
         print(f"Total uop execution time: {total_cycles} cycles")
+
+    def print_utilization(self):
+        """Print utilization statistics across execution"""
+        total_cycles = len(self.per_cycle_stats)
+        if total_cycles == 0:
+            return
+
+        max_issue_width = 2
+        unit_types = [InstructionType.REDUCE, InstructionType.FMA, InstructionType.EXP2,
+                      InstructionType.LOAD, InstructionType.STORE]
+
+        print("=== Utilization Statistics ===")
+        print()
+
+        # 1. Per execution unit: fraction of cycles with at least one active μop
+        print("[Per Execution Unit]")
+        for inst_type in unit_types:
+            active_cycles = sum(1 for s in self.per_cycle_stats
+                                if s['active_by_type'].get(inst_type, 0) > 0)
+            pct = active_cycles / total_cycles * 100
+            print(f"  {inst_type.value:8s}: {pct:5.1f}% ({active_cycles}/{total_cycles} cycles active)")
+        print()
+
+        # 2. Issue slot utilization
+        print("[Issue Slot Utilization]")
+        total_issued = sum(s['issued_count'] for s in self.per_cycle_stats)
+        max_possible = total_cycles * max_issue_width
+        cycles_with_issue = sum(1 for s in self.per_cycle_stats if s['issued_count'] > 0)
+        cycles_full = sum(1 for s in self.per_cycle_stats if s['issued_count'] >= max_issue_width)
+        avg_issued = total_issued / total_cycles
+        print(f"  Max issue width: {max_issue_width} μop/cycle")
+        print(f"  Cycles with issue: {cycles_with_issue}/{total_cycles} ({cycles_with_issue/total_cycles*100:.1f}%)")
+        print(f"  Cycles at full issue: {cycles_full}/{total_cycles} ({cycles_full/total_cycles*100:.1f}%)")
+        print(f"  Average issued: {avg_issued:.2f} μops/cycle")
+        print(f"  Overall issue slot utilization: {total_issued/max_possible*100:.1f}%")
+        print()
+
+        # 3. Per time window utilization
+        window_size = max(1, total_cycles // 10)
+        print(f"[Per Time Window (window size: {window_size} cycles)]")
+        print(f"  {'Window':>12s}  "
+              f"{'REDUCE':>7s}  {'FMA':>7s}  {'EXP2':>7s}  {'LOAD':>7s}  {'STORE':>7s}  {'Issue':>7s}")
+        for w_start in range(0, total_cycles, window_size):
+            w_end = min(w_start + window_size, total_cycles)
+            window = self.per_cycle_stats[w_start:w_end]
+            w_len = len(window)
+
+            active_pcts = {}
+            for inst_type in unit_types:
+                cycles = sum(1 for s in window if s['active_by_type'].get(inst_type, 0) > 0)
+                active_pcts[inst_type] = cycles / w_len * 100
+
+            issued_in_window = sum(s['issued_count'] for s in window)
+            issue_pct = issued_in_window / (w_len * max_issue_width) * 100
+
+            print(f"  {w_start:4d}-{w_end-1:<4d}   "
+                  f"{active_pcts[InstructionType.REDUCE]:6.1f}%  "
+                  f"{active_pcts[InstructionType.FMA]:6.1f}%  "
+                  f"{active_pcts[InstructionType.EXP2]:6.1f}%  "
+                  f"{active_pcts[InstructionType.LOAD]:6.1f}%  "
+                  f"{active_pcts[InstructionType.STORE]:6.1f}%  "
+                  f"{issue_pct:6.1f}%")
 
 
 def create_softmax_instruction_stream(reg_width, has_exp2_unit, num_heads, seq_chunk_bit) -> List[Instruction]:
@@ -1121,7 +1217,13 @@ def parse_arguments():
         default=128,
         help="Out-of-order execution window size"
     )
-    
+
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Only output total cycle count"
+    )
+
     return parser.parse_args()
 
 
@@ -1155,84 +1257,86 @@ def main():
         ooo_window_size=args.ooo_window_size
     )
     
-    print("RISC-V Vector Processor Softmax Simulator")
-    print("=" * 50)
-    print(f"Configuration:")
-    print(f"  Register width: {config.register_width} bits")
-    print(f"  Reduce compute unit width: {config.reduce_compute_unit_width} bits")
-    print(f"  Simple elementwise compute unit width: {config.simple_elementwise_compute_unit_width} bits")
-    print(f"  Complex elementwise compute unit width: {config.complex_elementwise_compute_unit_width} bits")
-    print(f"  Cache bandwidth: {config.cache_bandwidth} bytes/cycle")
-    print(f"  Execution mode: {config.execution_mode.value}")
-    print(f"  Chaining: {'enabled' if config.chaining_enabled else 'disabled'}")
-    if config.chaining_enabled:
-        print(f"  Chaining granularity: {config.chaining_granularity} bytes")
-    print()
-    
+    quiet = args.quiet
+
+    if not quiet:
+        print("RISC-V Vector Processor Softmax Simulator")
+        print("=" * 50)
+        print(f"Configuration:")
+        print(f"  Register width: {config.register_width} bits")
+        print(f"  Reduce compute unit width: {config.reduce_compute_unit_width} bits")
+        print(f"  Simple elementwise compute unit width: {config.simple_elementwise_compute_unit_width} bits")
+        print(f"  Complex elementwise compute unit width: {config.complex_elementwise_compute_unit_width} bits")
+        print(f"  Cache bandwidth: {config.cache_bandwidth} bytes/cycle")
+        print(f"  Execution mode: {config.execution_mode.value}")
+        print(f"  Chaining: {'enabled' if config.chaining_enabled else 'disabled'}")
+        if config.chaining_enabled:
+            print(f"  Chaining granularity: {config.chaining_granularity} bytes")
+        print()
+
     # Create processor
-    processor = VectorProcessor(config)
-    
+    processor = VectorProcessor(config, quiet=quiet)
+
     # Load sample softmax instruction stream
     instructions = create_softmax_instruction_stream(args.register_width, args.exp2_unit, args.num_heads, args.seq_chunk_bits)
     processor.load_instructions(instructions)
-    
-    print(f"Loaded {len(instructions)} instructions for softmax computation")
-    print("Instructions:")
-    for inst in instructions:
-        deps_str = f"depends on {list(inst.dependencies)}" if inst.dependencies else "no dependencies"
-        print(f"  {inst.id}: {inst.type.value} ({inst.data_size} bytes, {deps_str})")
-    print()
-    
+
+    if not quiet:
+        print(f"Loaded {len(instructions)} instructions for softmax computation")
+        print("Instructions:")
+        for inst in instructions:
+            deps_str = f"depends on {list(inst.dependencies)}" if inst.dependencies else "no dependencies"
+            print(f"  {inst.id}: {inst.type.value} ({inst.data_size} bytes, {deps_str})")
+        print()
+
     # Run simulation with longer timeout now
     results = processor.simulate(max_cycles=100000)
 
     assert processor.get_outstanding_instruction_count() == 0
     assert processor.get_outstanding_uop_count() == 0
-    
-    # Print results
-    print("Simulation Results:")
+
+    if not quiet:
+        print("Instruction Timeline:")
+        for inst_result in results['instructions']:
+            issue_str = f"issue:{inst_result['issue_cycle']}" if inst_result['issue_cycle'] >= 0 else "issue:N/A"
+            print(f"  Instruction {inst_result['id']} ({inst_result['type']}): "
+                  f"{issue_str}, cycles {inst_result['start_cycle']}-{inst_result['complete_cycle']} "
+                  f"(duration: {inst_result['execution_time']})")
+        print()
+
+        print(f"Generated {len(results['uops'])} micro-operations")
+        print()
+
+        # Print detailed uop timeline
+        print("Micro-operation (uop) Timeline:")
+        for uop_result in results['uops']:
+            inst_id = uop_result['instruction_id']
+            uop_id = uop_result['uop_id']
+            uop_type = uop_result['type']
+            start_cycle = uop_result['start_cycle']
+            complete_cycle = uop_result['complete_cycle']
+            execution_time = uop_result['execution_time']
+
+            print(f"  uop {inst_id}.{uop_id} ({uop_type}): "
+                  f"cycles {start_cycle}-{complete_cycle} "
+                  f"(duration: {execution_time})")
+        print()
+
+        # Display ASCII visualization
+        processor.visualize_execution()
+        print()
+
+        # Display uop-level ASCII visualization
+        processor.visualize_uop_execution()
+        print()
+
     print(f"Total execution time: {results['total_cycles']} cycles")
-    print()
-    
-    print("Instruction Timeline:")
-    for inst_result in results['instructions']:
-        issue_str = f"issue:{inst_result['issue_cycle']}" if inst_result['issue_cycle'] >= 0 else "issue:N/A"
-        print(f"  Instruction {inst_result['id']} ({inst_result['type']}): "
-              f"{issue_str}, cycles {inst_result['start_cycle']}-{inst_result['complete_cycle']} "
-              f"(duration: {inst_result['execution_time']})")
-    print()
-    
-    print(f"Generated {len(results['uops'])} micro-operations")
-    print()
-    
-    # Print detailed uop timeline
-    print("Micro-operation (uop) Timeline:")
-    for uop_result in results['uops']:
-        inst_id = uop_result['instruction_id']
-        uop_id = uop_result['uop_id']
-        uop_type = uop_result['type']
-        start_cycle = uop_result['start_cycle']
-        complete_cycle = uop_result['complete_cycle']
-        execution_time = uop_result['execution_time']
-        
-        # Use consistent format with instruction output, adding uop_id annotation
-        print(f"  uop {inst_id}.{uop_id} ({uop_type}): "
-              f"cycles {start_cycle}-{complete_cycle} "
-              f"(duration: {execution_time})")
-    print()
-    
-    # Display ASCII visualization
-    processor.visualize_execution()
-    print()
-    
-    # Display uop-level ASCII visualization  
-    processor.visualize_uop_execution()
-    print()
-    
-    # Calculate some performance metrics
     if results['instructions']:
         throughput = len(instructions) / results['total_cycles']
         print(f"Instruction throughput: {throughput:.3f} instructions/cycle")
+    print()
+
+    processor.print_utilization()
 
 
 if __name__ == "__main__":
