@@ -49,6 +49,9 @@ class ProcessorConfig:
     
     # Out-of-order execution window size
     ooo_window_size: int = 16
+
+    # Issue width (max μops per cycle)
+    issue_width: int = 2
     
     def __post_init__(self):
         # Check that all compute unit widths don't exceed register width
@@ -673,14 +676,13 @@ class VectorProcessor:
     def _issue_in_order(self):
         """Issue uops in order"""
         simulated_window_size = 10
-        issue_limit = 2
         issued_count = 0
         incompleted_uop_count = 0
         for uop in self.uops:
             if not uop.issued and self._can_issue_uop(uop):
                 if self._issue_uop(uop):
                     issued_count += 1
-                    if issued_count >= issue_limit:
+                    if issued_count >= self.config.issue_width:
                         break
             if not uop.completed:
                 incompleted_uop_count += 1
@@ -706,7 +708,7 @@ class VectorProcessor:
             if not uop.issued and self._can_issue_uop(uop):
                 if self._issue_uop(uop):
                     issued_count += 1
-                    if issued_count >= 2:  # Multi-issue limit
+                    if issued_count >= self.config.issue_width:
                         break
     
     def _can_issue_uop(self, uop: MicroOp) -> bool:
@@ -963,7 +965,7 @@ class VectorProcessor:
         if total_cycles == 0:
             return
 
-        max_issue_width = 2
+        max_issue_width = self.config.issue_width
         unit_types = [InstructionType.REDUCE, InstructionType.FMA, InstructionType.EXP2,
                       InstructionType.LOAD, InstructionType.STORE]
 
@@ -1219,6 +1221,14 @@ def parse_arguments():
     )
 
     parser.add_argument(
+        "--issue-width",
+        type=int,
+        choices=[1, 2],
+        default=2,
+        help="Max μops issued per cycle (1=single-issue, 2=dual-issue)"
+    )
+
+    parser.add_argument(
         "--quiet",
         action="store_true",
         help="Only output total cycle count"
@@ -1254,7 +1264,8 @@ def main():
         chaining_enabled=args.chaining,
         chaining_granularity=64,  # Keep default granularity
         execution_mode=execution_mode,
-        ooo_window_size=args.ooo_window_size
+        ooo_window_size=args.ooo_window_size,
+        issue_width=args.issue_width
     )
     
     quiet = args.quiet
