@@ -1274,7 +1274,8 @@ def create_rmsnorm_instruction_stream(reg_width, num_rows, num_contexts=1, lane_
     return [wrapper.instruction for wrapper in all_insts]
 
 
-def create_silu_instruction_stream(reg_width, num_rows, num_contexts=1, lane_strides=None) -> List[Instruction]:
+def create_silu_instruction_stream(reg_width, has_exp2_unit, num_rows,
+                                   num_contexts=1, lane_strides=None) -> List[Instruction]:
     """Create a SiLU activation instruction stream."""
     data_size = reg_width
     all_insts = []
@@ -1286,15 +1287,39 @@ def create_silu_instruction_stream(reg_width, num_rows, num_contexts=1, lane_str
                             data_size=data_size, vlane_ctx=0),
             FMAInstruction(id=base + 1, target_register=base + 1,
                            source_registers=[base + 0], data_size=data_size),
-            EXP2Instruction(id=base + 2, target_register=base + 2,
-                            source_registers=[base + 1], data_size=data_size),
-            FMAInstruction(id=base + 3, target_register=base + 3,
-                           source_registers=[base + 2], data_size=data_size),
-            FMAInstruction(id=base + 4, target_register=base + 4,
-                           source_registers=[base + 3], data_size=data_size),
-            StoreInstruction(id=base + 5, source_registers=[base + 4],
-                             data_size=data_size, vlane_ctx=1),
         ]
+        if has_exp2_unit:
+            row_insts += [
+                EXP2Instruction(id=base + 2, target_register=base + 2,
+                                source_registers=[base + 1], data_size=data_size),
+                FMAInstruction(id=base + 3, target_register=base + 3,
+                               source_registers=[base + 2], data_size=data_size),
+                FMAInstruction(id=base + 4, target_register=base + 4,
+                               source_registers=[base + 3], data_size=data_size),
+                StoreInstruction(id=base + 5, source_registers=[base + 4],
+                                 data_size=data_size, vlane_ctx=1),
+            ]
+        else:
+            row_insts += [
+                FMAInstruction(id=base + 2, target_register=base + 2,
+                               source_registers=[base + 1], data_size=data_size),
+                FMAInstruction(id=base + 3, target_register=base + 3,
+                               source_registers=[base + 2], data_size=data_size),
+                FMAInstruction(id=base + 4, target_register=base + 4,
+                               source_registers=[base + 3], data_size=data_size),
+                FMAInstruction(id=base + 5, target_register=base + 5,
+                               source_registers=[base + 4], data_size=data_size),
+                FMAInstruction(id=base + 6, target_register=base + 6,
+                               source_registers=[base + 5], data_size=data_size),
+                FMAInstruction(id=base + 7, target_register=base + 7,
+                               source_registers=[base + 6], data_size=data_size),
+                FMAInstruction(id=base + 8, target_register=base + 8,
+                               source_registers=[base + 7], data_size=data_size),
+                FMAInstruction(id=base + 9, target_register=base + 9,
+                               source_registers=[base + 8], data_size=data_size),
+                StoreInstruction(id=base + 10, source_registers=[base + 9],
+                                 data_size=data_size, vlane_ctx=1),
+            ]
 
         ctx = row % num_contexts
         for wrapper in row_insts:
@@ -1353,7 +1378,8 @@ def create_instruction_stream(kernel, reg_width, has_exp2_unit, num_heads, num_r
         )
     if kernel == "silu":
         return create_silu_instruction_stream(
-            reg_width, num_rows, num_contexts=num_contexts, lane_strides=lane_strides,
+            reg_width, has_exp2_unit, num_rows,
+            num_contexts=num_contexts, lane_strides=lane_strides,
         )
     if kernel == "rope":
         return create_rope_instruction_stream(
@@ -1496,6 +1522,37 @@ def _parse_bool(value) -> bool:
 
 def _md_cell(value) -> str:
     return str(value).replace("|", "\\|")
+
+
+def _format_pct(value) -> str:
+    return f"{value:.1f}%"
+
+
+def _ordered_unit_metrics(metrics: Dict) -> List[Tuple[str, float]]:
+    unit_active_pct = metrics.get('unit_active_pct', {})
+    return [
+        ('load', unit_active_pct.get('load', 0.0)),
+        ('store', unit_active_pct.get('store', 0.0)),
+        ('fma', unit_active_pct.get('fma', 0.0)),
+        ('reduce', unit_active_pct.get('reduce', 0.0)),
+        ('exp2', unit_active_pct.get('exp2', 0.0)),
+    ]
+
+
+def format_compact_utilization(results: Dict, processor: VectorProcessor, instruction_count: int = 0) -> str:
+    """Format a short simulation summary suitable for --quiet output."""
+    metrics = processor.get_utilization_metrics()
+    lines = [
+        f"Total execution time: {results['total_cycles']} cycles",
+        f"Issue slot utilization: {_format_pct(metrics['issue_slot_utilization'])} "
+        f"(avg {metrics['average_issued']:.2f} uops/cycle)",
+        "Execution unit utilization: " +
+        ", ".join(f"{name} {_format_pct(value)}" for name, value in _ordered_unit_metrics(metrics)),
+    ]
+    if instruction_count and results['total_cycles']:
+        throughput = instruction_count / results['total_cycles']
+        lines.append(f"Instruction throughput: {throughput:.3f} instructions/cycle")
+    return "\n".join(lines)
 
 
 def _coerce_benchmark_value(key: str, value):
@@ -1861,6 +1918,23 @@ def run_benchmark_suite(args) -> str:
     return "\n".join(lines) + "\n"
 
 
+def format_benchmark_quiet_summary(markdown_report: str, output_path: str) -> str:
+    """Extract the benchmark summary table for compact --quiet stdout."""
+    lines = markdown_report.splitlines()
+    try:
+        start = lines.index("## Summary")
+    except ValueError:
+        return f"Wrote benchmark results to {output_path}"
+
+    summary_lines = [f"Wrote benchmark results to {output_path}", ""]
+    for line in lines[start + 1:]:
+        if line.startswith("## "):
+            break
+        if line.strip():
+            summary_lines.append(line)
+    return "\n".join(summary_lines)
+
+
 def parse_arguments():
     """Parse command line arguments"""
     parser = argparse.ArgumentParser(
@@ -1878,7 +1952,7 @@ def parse_arguments():
     parser.add_argument(
         "--exp2-unit",
         action="store_true",
-        help="If true implement softmax with exp2 unit (requires complex elementwise unit)"
+        help="If true implement softmax and silu with a dedicated exp2 unit; otherwise use FMA approximation paths"
     )
 
     parser.add_argument(
@@ -2042,7 +2116,7 @@ def parse_arguments():
     parser.add_argument(
         "--quiet",
         action="store_true",
-        help="Only output total cycle count"
+        help="Print a compact summary without timelines or per-uop details"
     )
 
     return parser.parse_args()
@@ -2061,7 +2135,7 @@ def main():
             print(benchmark_md, end="")
             print(f"Wrote benchmark results to {benchmark_path}")
         else:
-            print(benchmark_path)
+            print(format_benchmark_quiet_summary(benchmark_md, benchmark_path))
         return
 
     quiet = args.quiet
@@ -2136,7 +2210,7 @@ def main():
         print()
 
     if quiet:
-        print(f"Total execution time: {results['total_cycles']} cycles")
+        print(format_compact_utilization(results, processor, len(instructions)))
         return
 
     print(f"Total execution time: {results['total_cycles']} cycles")

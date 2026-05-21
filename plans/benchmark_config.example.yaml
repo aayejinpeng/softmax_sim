@@ -13,7 +13,7 @@
 # - seq_chunk_bits -> softmax input size; simulator splits into seq_chunk_bits/register_width chunks
 # - all_compute_widths -> shared width for reduce / FMA / EXP2 units
 # - cache_bandwidth -> bytes per cycle, not bits; e.g. 64 means 64 bytes/cycle = 512 bits/cycle
-# - exp2_unit -> softmax exp implementation selector:
+# - exp2_unit -> softmax / silu exp implementation selector:
 #   false means exp2(x) is approximated by a dependent FMA polynomial chain;
 #   true means one dedicated EXP2 instruction replaces that FMA chain.
 #
@@ -27,7 +27,11 @@
 #   same graph, but one EXP2 replaces the six-FMA polynomial chain and produces
 #   the same exp result consumed by REDUCE(sum), STORE(exp scratch), and FMA(div).
 # - rmsnorm: LOAD(input) -> FMA(square) -> REDUCE(sum) -> FMA(scale) -> LOAD(weight shared) -> FMA(mul) -> STORE(output)
-# - silu: LOAD(input) -> FMA(negate) -> EXP2 -> FMA(add1) -> FMA(div/mul) -> STORE(output)
+# - silu, exp2_unit=false:
+#   LOAD(input) -> FMA(negate) -> FMA(poly1) -> FMA(poly2) -> FMA(poly3)
+#   -> FMA(poly4) -> FMA(poly5) -> FMA(poly6) -> FMA(add1) -> FMA(div/mul) -> STORE(output)
+# - silu, exp2_unit=true:
+#   same graph, but one EXP2 replaces the six-FMA exponent polynomial chain.
 # - rope: LOAD(theta shared) -> FMA(angle) -> LOAD(input) -> FMA(real/imag) -> STORE(output)
 #
 # Single-chain latency diagram convention
@@ -38,6 +42,9 @@
 #   4 first-level reduce uops plus 1 final reduce uop, each with 7-cycle latency.
 # - Full benchmark cycles can be larger/smaller because the simulator also models uop splitting,
 #   issue_width, shared execution-unit bandwidth, chaining, and multi-lane interleaving.
+#
+# Per-instruction tables are easier to read as CSV. See:
+# plans/benchmark_instruction_table.example.csv
 
 defaults:
   execution_mode: in-order
@@ -53,9 +60,9 @@ cases:
   - name: softmax_fma_exp_approx
     kernel: softmax
     exp2_unit: false
-    num_heads: 8
+    num_heads: 128
     seq_chunk_bits: 2048
-    lanes: [1, 2, 4]
+    lanes: [1, 2]
     issue_width: [1, 2]
     metadata:
       description: Softmax using a six-FMA polynomial approximation for exp2 when no dedicated EXP2 unit is available.
@@ -95,9 +102,9 @@ cases:
   - name: softmax_exp2_unit
     kernel: softmax
     exp2_unit: true
-    num_heads: 8
+    num_heads: 128
     seq_chunk_bits: 2048
-    lanes: [1, 2, 4]
+    lanes: [1, 2]
     issue_width: [1, 2]
     metadata:
       description: Softmax using a dedicated EXP2 unit; EXP2 replaces the six dependent FMA polynomial stages.
@@ -131,8 +138,8 @@ cases:
 
   - name: rmsnorm
     kernel: rmsnorm
-    num_rows: 8
-    lanes: [1, 2, 4]
+    num_rows: 128
+    lanes: [1, 2]
     issue_width: [1, 2]
     metadata:
       description: RMSNorm is modeled as per-row input, reduction, rescale, shared weight load, and output store.
@@ -157,17 +164,52 @@ cases:
         lane_stride_1: per-row output stride for vlane1 stores.
         lane_stride_2: shared weight stride; 0 means every lane reads the same weight block.
 
-  - name: silu
+  - name: silu_fma_exp_approx
     kernel: silu
-    num_rows: 8
-    lanes: [1, 2, 4]
+    exp2_unit: false
+    num_rows: 128
+    lanes: [1, 2]
     issue_width: [1, 2]
     metadata:
-      description: SiLU is modeled as a long elementwise chain dominated by EXP2 and FMA latency.
+      description: SiLU using a six-FMA polynomial approximation for the exponent stage.
+      lane_mapping: each lane is one independently runnable row.
+      dependency_chain: LOAD(input) -> FMA(negate) -> FMA(poly1) -> FMA(poly2) -> FMA(poly3) -> FMA(poly4) -> FMA(poly5) -> FMA(poly6) -> FMA(add1) -> FMA(div/mul) -> STORE(output)
+      latency_diagram: |
+        One SiLU row, exp2_unit=false, 11 vector instructions.
+        Stage-level critical path estimate: 56 cycles.
+
+        cycle 000-010  I00 LOAD(input)              latency 10
+        cycle 010-014  I01 FMA(negate)             latency 4
+        cycle 014-018  I02 FMA(exp poly 1)         latency 4
+        cycle 018-022  I03 FMA(exp poly 2)         latency 4
+        cycle 022-026  I04 FMA(exp poly 3)         latency 4
+        cycle 026-030  I05 FMA(exp poly 4)         latency 4
+        cycle 030-034  I06 FMA(exp poly 5)         latency 4
+        cycle 034-038  I07 FMA(exp poly 6)         latency 4
+        cycle 038-042  I08 FMA(add 1.0)            latency 4
+        cycle 042-046  I09 FMA(div/mul)            latency 4
+        cycle 046-056  I10 STORE(output)           latency 10
+      parameter_notes:
+        num_rows: number of independent rows to simulate.
+        exp2_unit: false selects the FMA polynomial exponent path. These six FMA instructions are an implementation alternative to the single EXP2 instruction in silu_exp2_unit.
+        fma_exp_dependencies: I02 depends on I01; I03 depends on I02; I04 depends on I03; I05 depends on I04; I06 depends on I05; I07 depends on I06.
+        lanes: number of independent contexts that can issue in parallel.
+        issue_width: maximum uops issued per cycle across all lanes.
+        lane_stride_0: per-row input stride for vlane0 loads.
+        lane_stride_1: per-row output stride for vlane1 stores.
+
+  - name: silu_exp2_unit
+    kernel: silu
+    exp2_unit: true
+    num_rows: 128
+    lanes: [1, 2]
+    issue_width: [1, 2]
+    metadata:
+      description: SiLU using a dedicated EXP2 unit; EXP2 replaces the six dependent FMA polynomial stages.
       lane_mapping: each lane is one independently runnable row.
       dependency_chain: LOAD(input) -> FMA(negate) -> EXP2 -> FMA(add1) -> FMA(div/mul) -> STORE(output)
       latency_diagram: |
-        One SiLU row, 6 vector instructions.
+        One SiLU row, exp2_unit=true, 6 vector instructions.
         Stage-level critical path estimate: 52 cycles.
 
         cycle 000-010  I00 LOAD(input)              latency 10
@@ -178,6 +220,8 @@ cases:
         cycle 042-052  I05 STORE(output)           latency 10
       parameter_notes:
         num_rows: number of independent rows to simulate.
+        exp2_unit: true selects the dedicated EXP2 path. I02 EXP2 replaces I02-I07 from silu_fma_exp_approx and produces the same logical exponent result for downstream users.
+        exp2_dependency: I02 EXP2 depends on I01 FMA(negate).
         lanes: number of independent contexts that can issue in parallel.
         issue_width: maximum uops issued per cycle across all lanes.
         lane_stride_0: per-row input stride for vlane0 loads.
@@ -185,8 +229,8 @@ cases:
 
   - name: rope
     kernel: rope
-    num_rows: 8
-    lanes: [1, 2, 4]
+    num_rows: 128
+    lanes: [1, 2]
     issue_width: [1, 2]
     metadata:
       description: RoPE mixes shared theta data with per-row input and output streams.

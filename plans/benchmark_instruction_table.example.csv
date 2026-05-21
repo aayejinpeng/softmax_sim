@@ -1,0 +1,54 @@
+case,kernel,variant,seq,id,instruction,unit,depends_on,stage_latency_cycles,notes
+softmax_fma_exp_approx,softmax,exp2_unit=false,0,I00,LOAD(input),load,-,10,vlane0 input stream
+softmax_fma_exp_approx,softmax,exp2_unit=false,1,I01,REDUCE(max),reduce,I00,14,14 = 7 first-level + 7 final-level for 2048b register and 512b reduce unit
+softmax_fma_exp_approx,softmax,exp2_unit=false,2,I02,LOAD(input/sub source),load,all I01 chunks,10,waits for all max reductions for this head
+softmax_fma_exp_approx,softmax,exp2_unit=false,3,I03,FMA(exp poly 1),fma,I02,4,first stage of FMA exp2 approximation
+softmax_fma_exp_approx,softmax,exp2_unit=false,4,I04,FMA(exp poly 2),fma,I03,4,dependent polynomial stage
+softmax_fma_exp_approx,softmax,exp2_unit=false,5,I05,FMA(exp poly 3),fma,I04,4,dependent polynomial stage
+softmax_fma_exp_approx,softmax,exp2_unit=false,6,I06,FMA(exp poly 4),fma,I05,4,dependent polynomial stage
+softmax_fma_exp_approx,softmax,exp2_unit=false,7,I07,FMA(exp poly 5),fma,I06,4,dependent polynomial stage
+softmax_fma_exp_approx,softmax,exp2_unit=false,8,I08,FMA(exp poly 6),fma,I07,4,produces exp result; replaceable by I08 EXP2 in softmax_exp2_unit
+softmax_fma_exp_approx,softmax,exp2_unit=false,9,I09,STORE(exp scratch),store,I08,10,vlane3 scratch stream
+softmax_fma_exp_approx,softmax,exp2_unit=false,10,I10,REDUCE(sum exp),reduce,I08,14,14 = 7 first-level + 7 final-level for 2048b register and 512b reduce unit
+softmax_fma_exp_approx,softmax,exp2_unit=false,11,I11,LOAD(exp scratch),load,I09,10,reload exp values from scratch
+softmax_fma_exp_approx,softmax,exp2_unit=false,12,I12,FMA(div by sum),fma,I11 + all I10 chunks,4,normalizes exp by reciprocal sum
+softmax_fma_exp_approx,softmax,exp2_unit=false,13,I13,STORE(output),store,I12,10,vlane1 output stream
+softmax_exp2_unit,softmax,exp2_unit=true,0,I00,LOAD(input),load,-,10,vlane0 input stream
+softmax_exp2_unit,softmax,exp2_unit=true,1,I01,REDUCE(max),reduce,I00,14,14 = 7 first-level + 7 final-level for 2048b register and 512b reduce unit
+softmax_exp2_unit,softmax,exp2_unit=true,2,I02,LOAD(input/sub source),load,all I01 chunks,10,waits for all max reductions for this head
+softmax_exp2_unit,softmax,exp2_unit=true,3,I08,EXP2(x - max),exp2,I02,20,replaces I03-I08 FMA polynomial chain in softmax_fma_exp_approx
+softmax_exp2_unit,softmax,exp2_unit=true,4,I09,STORE(exp scratch),store,I08,10,vlane3 scratch stream
+softmax_exp2_unit,softmax,exp2_unit=true,5,I10,REDUCE(sum exp),reduce,I08,14,14 = 7 first-level + 7 final-level for 2048b register and 512b reduce unit
+softmax_exp2_unit,softmax,exp2_unit=true,6,I11,LOAD(exp scratch),load,I09,10,reload exp values from scratch
+softmax_exp2_unit,softmax,exp2_unit=true,7,I12,FMA(div by sum),fma,I11 + all I10 chunks,4,normalizes exp by reciprocal sum
+softmax_exp2_unit,softmax,exp2_unit=true,8,I13,STORE(output),store,I12,10,vlane1 output stream
+rmsnorm_sweep,rmsnorm,,0,I00,LOAD(input),load,-,10,vlane0 per-row input
+rmsnorm_sweep,rmsnorm,,1,I01,FMA(square),fma,I00,4,square input elements
+rmsnorm_sweep,rmsnorm,,2,I02,REDUCE(sum squares),reduce,I01,14,14 = 7 first-level + 7 final-level for 2048b register and 512b reduce unit
+rmsnorm_sweep,rmsnorm,,3,I03,FMA(scale by rms),fma,I00 + I02,4,uses original input and row reduction
+rmsnorm_sweep,rmsnorm,,4,I04,LOAD(weight shared),load,I03,10,vlane2 shared weight stride 0
+rmsnorm_sweep,rmsnorm,,5,I05,FMA(multiply weight),fma,I03 + I04,4,applies shared weight
+rmsnorm_sweep,rmsnorm,,6,I06,STORE(output),store,I05,10,vlane1 per-row output
+silu_fma_exp_approx,silu,exp2_unit=false,0,I00,LOAD(input),load,-,10,vlane0 per-row input
+silu_fma_exp_approx,silu,exp2_unit=false,1,I01,FMA(negate),fma,I00,4,prepares sigmoid exponent input
+silu_fma_exp_approx,silu,exp2_unit=false,2,I02,FMA(exp poly 1),fma,I01,4,first stage of FMA exponent approximation
+silu_fma_exp_approx,silu,exp2_unit=false,3,I03,FMA(exp poly 2),fma,I02,4,dependent polynomial stage
+silu_fma_exp_approx,silu,exp2_unit=false,4,I04,FMA(exp poly 3),fma,I03,4,dependent polynomial stage
+silu_fma_exp_approx,silu,exp2_unit=false,5,I05,FMA(exp poly 4),fma,I04,4,dependent polynomial stage
+silu_fma_exp_approx,silu,exp2_unit=false,6,I06,FMA(exp poly 5),fma,I05,4,dependent polynomial stage
+silu_fma_exp_approx,silu,exp2_unit=false,7,I07,FMA(exp poly 6),fma,I06,4,produces exponent result; replaceable by I02 EXP2 in silu_exp2_unit
+silu_fma_exp_approx,silu,exp2_unit=false,8,I08,FMA(add 1.0),fma,I07,4,denominator preparation
+silu_fma_exp_approx,silu,exp2_unit=false,9,I09,FMA(div/mul),fma,I08,4,final SiLU value
+silu_fma_exp_approx,silu,exp2_unit=false,10,I10,STORE(output),store,I09,10,vlane1 per-row output
+silu_exp2_unit,silu,exp2_unit=true,0,I00,LOAD(input),load,-,10,vlane0 per-row input
+silu_exp2_unit,silu,exp2_unit=true,1,I01,FMA(negate),fma,I00,4,prepares sigmoid exponent input
+silu_exp2_unit,silu,exp2_unit=true,2,I02,EXP2,exp2,I01,20,replaces I02-I07 FMA polynomial chain in silu_fma_exp_approx
+silu_exp2_unit,silu,exp2_unit=true,3,I03,FMA(add 1.0),fma,I02,4,denominator preparation
+silu_exp2_unit,silu,exp2_unit=true,4,I04,FMA(div/mul),fma,I03,4,final SiLU value
+silu_exp2_unit,silu,exp2_unit=true,5,I05,STORE(output),store,I04,10,vlane1 per-row output
+rope_sweep,rope,,0,I00,LOAD(theta shared),load,-,10,vlane2 shared theta stride 0
+rope_sweep,rope,,1,I01,FMA(angle = theta*pos),fma,I00,4,computes angle
+rope_sweep,rope,,2,I02,LOAD(input real/imag),load,I01,10,vlane0 per-row input
+rope_sweep,rope,,3,I03,FMA(real output),fma,I01 + I02,4,real component
+rope_sweep,rope,,4,I04,FMA(imag output),fma,I01 + I02 + I03,4,imag component depends on real in this simplified model
+rope_sweep,rope,,5,I05,STORE(output),store,I03 + I04,10,vlane1 output stream
