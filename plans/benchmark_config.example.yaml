@@ -1,0 +1,211 @@
+# Benchmark config anatomy
+#
+# - defaults: hardware / simulator knobs shared by every case
+# - cases: workload-specific cases
+# - metadata: documentation only; ignored by the simulator, preserved in the report
+#
+# Parameter meanings
+# - lanes -> num_contexts, i.e. how many independent lane contexts can run in parallel
+# - issue_width -> max uops issued per cycle across all active lanes
+# - lane_stride_0..3 -> vlane0..vlane3 byte strides; 0 means shared data
+# - num_heads -> independent softmax heads
+# - num_rows -> independent rows for rmsnorm / silu / rope
+# - seq_chunk_bits -> softmax input size; simulator splits into seq_chunk_bits/register_width chunks
+# - all_compute_widths -> shared width for reduce / FMA / EXP2 units
+# - cache_bandwidth -> bytes per cycle, not bits; e.g. 64 means 64 bytes/cycle = 512 bits/cycle
+# - exp2_unit -> softmax exp implementation selector:
+#   false means exp2(x) is approximated by a dependent FMA polynomial chain;
+#   true means one dedicated EXP2 instruction replaces that FMA chain.
+#
+# Dependency-chain notation
+# - softmax, exp2_unit=false:
+#   LOAD(input) -> REDUCE(max) -> LOAD(subtract; waits for all max reductions)
+#   -> FMA(poly1) -> FMA(poly2) -> FMA(poly3) -> FMA(poly4) -> FMA(poly5) -> FMA(poly6)
+#   -> REDUCE(sum) + STORE(exp scratch) -> LOAD(exp scratch)
+#   -> FMA(div; waits for sum and scratch reload) -> STORE(output)
+# - softmax, exp2_unit=true:
+#   same graph, but one EXP2 replaces the six-FMA polynomial chain and produces
+#   the same exp result consumed by REDUCE(sum), STORE(exp scratch), and FMA(div).
+# - rmsnorm: LOAD(input) -> FMA(square) -> REDUCE(sum) -> FMA(scale) -> LOAD(weight shared) -> FMA(mul) -> STORE(output)
+# - silu: LOAD(input) -> FMA(negate) -> EXP2 -> FMA(add1) -> FMA(div/mul) -> STORE(output)
+# - rope: LOAD(theta shared) -> FMA(angle) -> LOAD(input) -> FMA(real/imag) -> STORE(output)
+#
+# Single-chain latency diagram convention
+# - The diagrams below describe one independent lane/head/row with no other lane contention.
+# - They use the default stage latencies in softmax_simulator.py:
+#   LOAD=10 cycles, STORE=10 cycles, FMA=4 cycles, EXP2=20 cycles.
+# - REDUCE is shown as 14 cycles for register_width=2048 and reduce width=512:
+#   4 first-level reduce uops plus 1 final reduce uop, each with 7-cycle latency.
+# - Full benchmark cycles can be larger/smaller because the simulator also models uop splitting,
+#   issue_width, shared execution-unit bandwidth, chaining, and multi-lane interleaving.
+
+defaults:
+  execution_mode: in-order
+  register_width: 2048
+  cache_bandwidth: 64  # bytes per cycle
+  all_compute_widths: 512
+  lane_stride_0: 256
+  lane_stride_1: 256
+  lane_stride_2: 0
+  lane_stride_3: 256
+
+cases:
+  - name: softmax_fma_exp_approx
+    kernel: softmax
+    exp2_unit: false
+    num_heads: 8
+    seq_chunk_bits: 2048
+    lanes: [1, 2, 4]
+    issue_width: [1, 2]
+    metadata:
+      description: Softmax using a six-FMA polynomial approximation for exp2 when no dedicated EXP2 unit is available.
+      lane_mapping: lanes becomes num_contexts; each lane is one independently runnable head context.
+      dependency_chain: LOAD(input) -> REDUCE(max) -> LOAD(subtract) -> FMA(poly1) -> FMA(poly2) -> FMA(poly3) -> FMA(poly4) -> FMA(poly5) -> FMA(poly6) -> REDUCE(sum) + STORE(exp scratch) -> LOAD(exp scratch) -> FMA(div) -> STORE(output)
+      latency_diagram: |
+        One softmax head, one vector chunk, exp2_unit=false, 14 vector instructions.
+        Stage-level critical path estimate: 92 cycles.
+
+        cycle 000-010  I00 LOAD(input)              latency 10
+        cycle 010-024  I01 REDUCE(max)              latency 14
+        cycle 024-034  I02 LOAD(input/sub source)   latency 10
+        cycle 034-038  I03 FMA(exp poly 1)          latency 4
+        cycle 038-042  I04 FMA(exp poly 2)          latency 4
+        cycle 042-046  I05 FMA(exp poly 3)          latency 4
+        cycle 046-050  I06 FMA(exp poly 4)          latency 4
+        cycle 050-054  I07 FMA(exp poly 5)          latency 4
+        cycle 054-058  I08 FMA(exp poly 6)          latency 4
+        cycle 058-072  I10 REDUCE(sum exp)          latency 14
+        cycle 058-068  I09 STORE(exp scratch)       latency 10
+        cycle 068-078  I11 LOAD(exp scratch)        latency 10
+        cycle 078-082  I12 FMA(div by sum)          latency 4, waits for I10 and I11
+        cycle 082-092  I13 STORE(output)            latency 10
+      parameter_notes:
+        num_heads: number of independent attention heads to simulate.
+        seq_chunk_bits: input size per head; larger values increase the number of vector-sized chunks per head.
+        exp2_unit: false selects the FMA polynomial path. These six FMA instructions are an implementation alternative to the single EXP2 instruction in softmax_exp2_unit.
+        fma_exp_dependencies: I03 depends on I02; I04 depends on I03; I05 depends on I04; I06 depends on I05; I07 depends on I06; I08 depends on I07.
+        exp_result_fanout: I08 is the exp result. I09 STORE(exp scratch) and I10 REDUCE(sum exp) both depend on I08.
+        final_div_dependencies: I11 LOAD(exp scratch) depends on I09. I12 FMA(div by sum) depends on I11 and on every I10 sum-reduction chunk. I13 STORE(output) depends on I12.
+        lanes: number of independent contexts that can issue in parallel.
+        issue_width: maximum uops issued per cycle across all lanes.
+        lane_stride_0: per-lane input stride for vlane0 loads.
+        lane_stride_1: per-lane output stride for vlane1 stores.
+        lane_stride_3: scratch stride for the exp-reload path used in this softmax model.
+
+  - name: softmax_exp2_unit
+    kernel: softmax
+    exp2_unit: true
+    num_heads: 8
+    seq_chunk_bits: 2048
+    lanes: [1, 2, 4]
+    issue_width: [1, 2]
+    metadata:
+      description: Softmax using a dedicated EXP2 unit; EXP2 replaces the six dependent FMA polynomial stages.
+      lane_mapping: lanes becomes num_contexts; each lane is one independently runnable head context.
+      dependency_chain: LOAD(input) -> REDUCE(max) -> LOAD(subtract) -> EXP2 -> REDUCE(sum) + STORE(exp scratch) -> LOAD(exp scratch) -> FMA(div) -> STORE(output)
+      latency_diagram: |
+        One softmax head, one vector chunk, exp2_unit=true, 9 vector instructions.
+        Stage-level critical path estimate: 88 cycles.
+
+        cycle 000-010  I00 LOAD(input)              latency 10
+        cycle 010-024  I01 REDUCE(max)              latency 14
+        cycle 024-034  I02 LOAD(input/sub source)   latency 10
+        cycle 034-054  I08 EXP2(x - max)            latency 20
+        cycle 054-068  I10 REDUCE(sum exp)          latency 14
+        cycle 054-064  I09 STORE(exp scratch)       latency 10
+        cycle 064-074  I11 LOAD(exp scratch)        latency 10
+        cycle 074-078  I12 FMA(div by sum)          latency 4, waits for I10 and I11
+        cycle 078-088  I13 STORE(output)            latency 10
+      parameter_notes:
+        num_heads: number of independent attention heads to simulate.
+        seq_chunk_bits: input size per head; larger values increase the number of vector-sized chunks per head.
+        exp2_unit: true selects the dedicated EXP2 path. I08 EXP2 replaces I03-I08 from softmax_fma_exp_approx and produces the same logical exp result for downstream users.
+        exp2_dependency: I08 EXP2 depends on I02 LOAD(input/sub source), which already waits for all max reductions for this head.
+        exp_result_fanout: I09 STORE(exp scratch) and I10 REDUCE(sum exp) both depend on I08.
+        final_div_dependencies: I11 LOAD(exp scratch) depends on I09. I12 FMA(div by sum) depends on I11 and on every I10 sum-reduction chunk. I13 STORE(output) depends on I12.
+        lanes: number of independent contexts that can issue in parallel.
+        issue_width: maximum uops issued per cycle across all lanes.
+        lane_stride_0: per-lane input stride for vlane0 loads.
+        lane_stride_1: per-lane output stride for vlane1 stores.
+        lane_stride_3: scratch stride for the exp-reload path used in this softmax model.
+
+  - name: rmsnorm
+    kernel: rmsnorm
+    num_rows: 8
+    lanes: [1, 2, 4]
+    issue_width: [1, 2]
+    metadata:
+      description: RMSNorm is modeled as per-row input, reduction, rescale, shared weight load, and output store.
+      lane_mapping: each lane is one independently runnable row.
+      dependency_chain: LOAD(input) -> FMA(square) -> REDUCE(sum) -> FMA(scale) -> LOAD(weight shared) -> FMA(mul) -> STORE(output)
+      latency_diagram: |
+        One RMSNorm row, 7 vector instructions.
+        Stage-level critical path estimate: 56 cycles.
+
+        cycle 000-010  I00 LOAD(input)              latency 10
+        cycle 010-014  I01 FMA(square)             latency 4
+        cycle 014-028  I02 REDUCE(sum squares)     latency 14
+        cycle 028-032  I03 FMA(scale by rms)       latency 4
+        cycle 032-042  I04 LOAD(weight shared)     latency 10, vlane2 stride 0
+        cycle 042-046  I05 FMA(multiply weight)    latency 4
+        cycle 046-056  I06 STORE(output)           latency 10
+      parameter_notes:
+        num_rows: number of independent rows to simulate.
+        lanes: number of independent contexts that can issue in parallel.
+        issue_width: maximum uops issued per cycle across all lanes.
+        lane_stride_0: per-row input stride for vlane0 loads.
+        lane_stride_1: per-row output stride for vlane1 stores.
+        lane_stride_2: shared weight stride; 0 means every lane reads the same weight block.
+
+  - name: silu
+    kernel: silu
+    num_rows: 8
+    lanes: [1, 2, 4]
+    issue_width: [1, 2]
+    metadata:
+      description: SiLU is modeled as a long elementwise chain dominated by EXP2 and FMA latency.
+      lane_mapping: each lane is one independently runnable row.
+      dependency_chain: LOAD(input) -> FMA(negate) -> EXP2 -> FMA(add1) -> FMA(div/mul) -> STORE(output)
+      latency_diagram: |
+        One SiLU row, 6 vector instructions.
+        Stage-level critical path estimate: 52 cycles.
+
+        cycle 000-010  I00 LOAD(input)              latency 10
+        cycle 010-014  I01 FMA(negate)             latency 4
+        cycle 014-034  I02 EXP2                    latency 20
+        cycle 034-038  I03 FMA(add 1.0)            latency 4
+        cycle 038-042  I04 FMA(div/mul)            latency 4
+        cycle 042-052  I05 STORE(output)           latency 10
+      parameter_notes:
+        num_rows: number of independent rows to simulate.
+        lanes: number of independent contexts that can issue in parallel.
+        issue_width: maximum uops issued per cycle across all lanes.
+        lane_stride_0: per-row input stride for vlane0 loads.
+        lane_stride_1: per-row output stride for vlane1 stores.
+
+  - name: rope
+    kernel: rope
+    num_rows: 8
+    lanes: [1, 2, 4]
+    issue_width: [1, 2]
+    metadata:
+      description: RoPE mixes shared theta data with per-row input and output streams.
+      lane_mapping: each lane is one independently runnable row or position block.
+      dependency_chain: LOAD(theta shared) -> FMA(angle) -> LOAD(input) -> FMA(real/imag) -> STORE(output)
+      latency_diagram: |
+        One RoPE row/position block, 6 vector instructions.
+        Stage-level critical path estimate: 42 cycles.
+
+        cycle 000-010  I00 LOAD(theta shared)       latency 10, vlane2 stride 0
+        cycle 010-014  I01 FMA(angle = theta*pos)  latency 4
+        cycle 014-024  I02 LOAD(input real/imag)   latency 10
+        cycle 024-028  I03 FMA(real output)        latency 4
+        cycle 028-032  I04 FMA(imag output)        latency 4
+        cycle 032-042  I05 STORE(output)           latency 10
+      parameter_notes:
+        num_rows: number of independent rows to simulate.
+        lanes: number of independent contexts that can issue in parallel.
+        issue_width: maximum uops issued per cycle across all lanes.
+        lane_stride_0: per-row input stride for vlane0 loads.
+        lane_stride_1: per-row output stride for vlane1 stores.
+        lane_stride_2: shared theta stride; 0 means every lane reads the same theta block.

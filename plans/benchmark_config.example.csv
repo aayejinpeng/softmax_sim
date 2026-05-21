@@ -1,0 +1,5 @@
+name,kernel,lanes,issue_width,num_heads,num_rows,register_width,seq_chunk_bits,lane_stride_0,lane_stride_1,lane_stride_2,lane_stride_3,description,dependency_chain
+softmax_sweep,softmax,1|2|4,1|2,8,,2048,2048,256,256,0,256,"Softmax builds one long dependency chain per head.","LOAD(input) -> REDUCE(max) -> LOAD(subtract) -> EXP2/FMA chain -> REDUCE(sum) -> FMA(div) -> STORE(output)"
+rmsnorm_sweep,rmsnorm,1|2|4,1|2,,8,2048,,256,256,0,0,"RMSNorm is modeled as per-row input, reduction, rescale, shared weight load, and output store.","LOAD(input) -> FMA(square) -> REDUCE(sum) -> FMA(scale) -> LOAD(weight shared) -> FMA(mul) -> STORE(output)"
+silu_sweep,silu,1|2|4,1|2,,8,2048,,256,256,0,0,"SiLU is modeled as a long elementwise chain dominated by EXP2 and FMA latency.","LOAD(input) -> FMA(negate) -> EXP2 -> FMA(add1) -> FMA(div/mul) -> STORE(output)"
+rope_sweep,rope,1|2|4,1|2,,8,2048,,256,256,0,0,"RoPE mixes shared theta data with per-row input and output streams.","LOAD(theta shared) -> FMA(angle) -> LOAD(input) -> FMA(real/imag) -> STORE(output)"

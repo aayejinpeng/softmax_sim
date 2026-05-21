@@ -7,6 +7,7 @@ with configurable architecture parameters and instruction scheduling.
 """
 
 from enum import Enum
+import csv
 import re
 from typing import List, Dict, Optional, Set, Tuple
 from dataclasses import dataclass
@@ -26,6 +27,13 @@ class InstructionType(Enum):
 class ExecutionMode(Enum):
     IN_ORDER = "in_order"
     OUT_OF_ORDER = "out_of_order"
+
+
+def _dependency_set(dependencies) -> Set[int]:
+    """Normalize optional dependency inputs to a set of instruction IDs."""
+    if dependencies is None:
+        return set()
+    return set(dependencies)
 
 
 @dataclass
@@ -55,6 +63,9 @@ class ProcessorConfig:
 
     # Number of hardware contexts (register groups)
     num_contexts: int = 1
+
+    # RVV multi-lane stride CSRs: vlane0-vlane3, in bytes.
+    lane_strides: Tuple[int, int, int, int] = (0, 0, 0, 0)
     
     def __post_init__(self):
         # Check that all compute unit widths don't exceed register width
@@ -82,6 +93,12 @@ class ProcessorConfig:
             raise ValueError(f"Invalid cache bandwidth: {self.cache_bandwidth}")
         if self.chaining_granularity not in valid_chain_gran:
             raise ValueError(f"Invalid chaining granularity: {self.chaining_granularity}")
+        if self.num_contexts < 1 or self.num_contexts > 8:
+            raise ValueError("num_contexts must be between 1 and 8")
+        if len(self.lane_strides) != 4:
+            raise ValueError("lane_strides must contain exactly 4 entries")
+        if any(stride < 0 for stride in self.lane_strides):
+            raise ValueError("lane_strides entries must be non-negative byte counts")
 
 
 @dataclass
@@ -100,6 +117,9 @@ class Instruction:
     # Context (register group) this instruction belongs to
     context_id: int = 0
 
+    # RVV multi-lane load/store stride context (vlane0-vlane3)
+    vlane_ctx: int = 0
+
     # Execution state
     issued: bool = False
     started: bool = False
@@ -113,14 +133,16 @@ class Instruction:
 class LoadInstruction:
     """Simplified wrapper for creating LOAD instructions"""
     
-    def __init__(self, id: int, target_register: int, dependencies: Set[int] = None, data_size: int = 256):
+    def __init__(self, id: int, target_register: int, dependencies: Set[int] = None,
+                 data_size: int = 256, vlane_ctx: int = 0):
         self.instruction = Instruction(
             id=id,
             type=InstructionType.LOAD,
-            dependencies=dependencies or set(),
+            dependencies=_dependency_set(dependencies),
             data_size=data_size,  # Default 2048 bits = 256 bytes
             target_register=target_register,
             element_wise_dest=True,
+            vlane_ctx=vlane_ctx,
         )
     
     def __getattr__(self, name):
@@ -135,6 +157,8 @@ class ReduceInstruction:
         # If dependencies not explicitly provided, derive from source_registers
         if dependencies is None:
             dependencies = set(source_registers) if source_registers else set()
+        else:
+            dependencies = _dependency_set(dependencies)
         
         self.instruction = Instruction(
             id=id,
@@ -160,6 +184,8 @@ class FMAInstruction:
         # If dependencies not explicitly provided, derive from source_registers
         if dependencies is None:
             dependencies = set(source_registers) if source_registers else set()
+        else:
+            dependencies = _dependency_set(dependencies)
         
         self.instruction = Instruction(
             id=id,
@@ -183,6 +209,8 @@ class EXP2Instruction:
         # If dependencies not explicitly provided, derive from source_registers
         if dependencies is None:
             dependencies = set(source_registers) if source_registers else set()
+        else:
+            dependencies = _dependency_set(dependencies)
         
         self.instruction = Instruction(
             id=id,
@@ -202,10 +230,13 @@ class StoreInstruction:
     """Simplified wrapper for creating STORE instructions"""
     
     def __init__(self, id: int, source_registers: List[int], 
-                 dependencies: Set[int] = None, target_mem: int = None, data_size: int = 256):
+                 dependencies: Set[int] = None, target_mem: int = None, data_size: int = 256,
+                 vlane_ctx: int = 0):
         # If dependencies not explicitly provided, derive from source_registers
         if dependencies is None:
             dependencies = set(source_registers) if source_registers else set()
+        else:
+            dependencies = _dependency_set(dependencies)
         
         self.instruction = Instruction(
             id=id,
@@ -214,6 +245,7 @@ class StoreInstruction:
             data_size=data_size,  # Default 2048 bits = 256 bytes
             target_register=target_mem,
             element_wise_src=True,
+            vlane_ctx=vlane_ctx,
         )
     
     def __getattr__(self, name):
@@ -232,6 +264,10 @@ class MicroOp:
 
     # Context this uop belongs to
     context_id: int = 0
+
+    # RVV multi-lane load/store stride context and modeled logical address
+    vlane_ctx: int = 0
+    address: Optional[int] = None
 
     # Execution state
     issued: bool = False
@@ -264,6 +300,7 @@ class InstructionExecutor:
 
         for uop in uops:
             uop.context_id = instruction.context_id
+            uop.vlane_ctx = instruction.vlane_ctx
 
         return uops
     
@@ -393,10 +430,14 @@ class InstructionExecutor:
             print(f"Instruction data bytes: {actual_bytes}")
 
         assert actual_bytes <= max_bytes_per_instruction
+        if instruction.vlane_ctx < 0 or instruction.vlane_ctx >= len(self.config.lane_strides):
+            raise ValueError(f"Invalid vlane_ctx: {instruction.vlane_ctx}")
         
         uops = []
         remaining_bytes = actual_bytes
         uop_id = 0
+        chunk_offset = 0
+        lane_stride = self.config.lane_strides[instruction.vlane_ctx]
         
         while remaining_bytes > 0:
             bytes_in_uop = min(bytes_per_cycle, remaining_bytes)
@@ -413,12 +454,15 @@ class InstructionExecutor:
                 type=instruction.type,
                 data_size=bytes_in_uop,
                 dependencies=dependencies,
-                latency=latency
+                latency=latency,
+                vlane_ctx=instruction.vlane_ctx,
+                address=chunk_offset + instruction.context_id * lane_stride,
             )
             # print(f"uop {uop_id} dependencies: {dependencies}")
             uops.append(uop)
             
             remaining_bytes -= bytes_in_uop  
+            chunk_offset += bytes_in_uop
             uop_id += 1
         
         return uops
@@ -875,12 +919,43 @@ class VectorProcessor:
                     'instruction_id': uop.instruction_id,
                     'uop_id': uop.uop_id,
                     'type': uop.type.value,
+                    'context_id': uop.context_id,
+                    'vlane_ctx': uop.vlane_ctx,
+                    'address': uop.address,
                     'start_cycle': uop.start_cycle,
                     'complete_cycle': uop.complete_cycle,
                     'execution_time': uop.complete_cycle - uop.start_cycle if uop.start_cycle >= 0 else -1
                 }
                 for uop in self.uops
             ]
+        }
+
+    def get_utilization_metrics(self) -> Dict:
+        """Return compact utilization statistics for reports and benchmarks."""
+        total_cycles = len(self.per_cycle_stats)
+        if total_cycles == 0:
+            return {
+                'total_cycles': 0,
+                'issue_slot_utilization': 0.0,
+                'average_issued': 0.0,
+                'unit_active_pct': {inst_type.value: 0.0 for inst_type in self.execution_units}
+            }
+
+        total_issued = sum(s['issued_count'] for s in self.per_cycle_stats)
+        max_possible = total_cycles * self.config.issue_width
+        unit_active_pct = {}
+        for inst_type in self.execution_units:
+            active_cycles = sum(
+                1 for s in self.per_cycle_stats
+                if s['active_by_type'].get(inst_type, 0) > 0
+            )
+            unit_active_pct[inst_type.value] = active_cycles / total_cycles * 100
+
+        return {
+            'total_cycles': total_cycles,
+            'issue_slot_utilization': total_issued / max_possible * 100 if max_possible else 0.0,
+            'average_issued': total_issued / total_cycles,
+            'unit_active_pct': unit_active_pct,
         }
     
     def get_outstanding_instruction_count(self) -> int:
@@ -1050,7 +1125,8 @@ class VectorProcessor:
                   f"{issue_pct:6.1f}%")
 
 
-def create_softmax_instruction_stream(reg_width, has_exp2_unit, num_heads, seq_chunk_bit, num_contexts=1) -> List[Instruction]:
+def create_softmax_instruction_stream(reg_width, has_exp2_unit, num_heads, seq_chunk_bit,
+                                      num_contexts=1, lane_strides=None) -> List[Instruction]:
     """Create a sample instruction stream for softmax computation"""
     # Use custom data size (1024 bytes) for this example to maintain compatibility
     # with existing simulation, override the default 256 bytes
@@ -1079,7 +1155,8 @@ def create_softmax_instruction_stream(reg_width, has_exp2_unit, num_heads, seq_c
             dep_group_id = head_id + i*100
             per_head_insts += [
                 # Load input vector
-                LoadInstruction(id=dep_group_id + 0, target_register=dep_group_id + 0, data_size=reg_width),
+                LoadInstruction(id=dep_group_id + 0, target_register=dep_group_id + 0,
+                                data_size=reg_width, vlane_ctx=0),
                 
                 # Find maximum value
                 ReduceInstruction(id=dep_group_id + 1, target_register=dep_group_id + 1, source_registers=[dep_group_id + 0], 
@@ -1094,8 +1171,8 @@ def create_softmax_instruction_stream(reg_width, has_exp2_unit, num_heads, seq_c
                 dep_group_id = head_id + i*100
                 per_head_insts += [
                     # Subtract max from all elements (x - max)
-                    LoadInstruction(id=dep_group_id + 2, target_register=dep_group_id + 2, dependencies=max_reduce_fake_dest,
-                                data_size=reg_width),
+                    LoadInstruction(id=dep_group_id + 2, target_register=dep_group_id + 2,
+                                dependencies=max_reduce_fake_dest, data_size=reg_width, vlane_ctx=0),
                     FMAInstruction(id=dep_group_id + 3, target_register=dep_group_id + 3, source_registers=[dep_group_id + 2],
                                 data_size=reg_width),
                     FMAInstruction(id=dep_group_id + 4, target_register=dep_group_id + 4, source_registers=[dep_group_id + 3],
@@ -1108,7 +1185,8 @@ def create_softmax_instruction_stream(reg_width, has_exp2_unit, num_heads, seq_c
                                 data_size=reg_width),
                     FMAInstruction(id=dep_group_id + 8, target_register=dep_group_id + 8, source_registers=[dep_group_id + 7],
                                 data_size=reg_width),
-                    StoreInstruction(id=dep_group_id + 9, target_mem=dep_group_id + 9, source_registers=[dep_group_id + 8], data_size=reg_width)
+                    StoreInstruction(id=dep_group_id + 9, target_mem=dep_group_id + 9,
+                                     source_registers=[dep_group_id + 8], data_size=reg_width, vlane_ctx=3)
                 ]
         else:
             for i in range(explicit_split_count):
@@ -1116,10 +1194,11 @@ def create_softmax_instruction_stream(reg_width, has_exp2_unit, num_heads, seq_c
                 per_head_insts += [
                     # Compute exp2(x - max)
                     LoadInstruction(id=dep_group_id + 2, target_register=dep_group_id + 2, dependencies=max_reduce_fake_dest,
-                                    data_size=reg_width),
+                                    data_size=reg_width, vlane_ctx=0),
                     EXP2Instruction(id=dep_group_id + 8, target_register=dep_group_id + 8, source_registers=[dep_group_id + 2],
                                     data_size=reg_width),
-                    StoreInstruction(id=dep_group_id + 9, target_mem=dep_group_id + 9, source_registers=[dep_group_id + 8], data_size=reg_width)
+                    StoreInstruction(id=dep_group_id + 9, target_mem=dep_group_id + 9,
+                                     source_registers=[dep_group_id + 8], data_size=reg_width, vlane_ctx=3)
                 ]
 
         sum_reduce_fake_dest = []
@@ -1135,14 +1214,15 @@ def create_softmax_instruction_stream(reg_width, has_exp2_unit, num_heads, seq_c
         for i in range(explicit_split_count):
             dep_group_id = head_id + i*100
             per_head_insts += [
-                LoadInstruction(id=dep_group_id + 11, target_register=dep_group_id + 11, dependencies=[dep_group_id + 9],
-                                data_size=reg_width),
+                LoadInstruction(id=dep_group_id + 11, target_register=dep_group_id + 11,
+                                dependencies=[dep_group_id + 9], data_size=reg_width, vlane_ctx=3),
                 # Divide by sum (exp / sum)
                 FMAInstruction(id=dep_group_id + 12, target_register=dep_group_id + 12,
                                source_registers=[dep_group_id + 11] + sum_reduce_fake_dest,
                                data_size=reg_width),
                 # Store result
-                StoreInstruction(id=dep_group_id + 13, source_registers=[dep_group_id + 12], data_size=reg_width)
+                StoreInstruction(id=dep_group_id + 13, source_registers=[dep_group_id + 12],
+                                 data_size=reg_width, vlane_ctx=1)
             ]
 
         # Assign context (register group) for this head
@@ -1154,6 +1234,631 @@ def create_softmax_instruction_stream(reg_width, has_exp2_unit, num_heads, seq_c
     
     # Extract the underlying Instruction objects for compatibility
     return [wrapper.instruction for wrapper in all_insts]
+
+
+def create_rmsnorm_instruction_stream(reg_width, num_rows, num_contexts=1, lane_strides=None) -> List[Instruction]:
+    """Create an RMSNorm-like instruction stream.
+
+    vlane0 models per-row input, vlane1 per-row output, and vlane2 shared
+    weights. The dependencies intentionally form a long chain to expose TLP
+    benefits from multiple contexts.
+    """
+    data_size = reg_width
+    all_insts = []
+
+    for row in range(num_rows):
+        base = row * 100
+        row_insts = [
+            LoadInstruction(id=base + 0, target_register=base + 0,
+                            data_size=data_size, vlane_ctx=0),
+            FMAInstruction(id=base + 1, target_register=base + 1,
+                           source_registers=[base + 0], data_size=data_size),
+            ReduceInstruction(id=base + 2, target_register=base + 2,
+                              source_registers=[base + 1], data_size=data_size),
+            FMAInstruction(id=base + 3, target_register=base + 3,
+                           source_registers=[base + 0, base + 2],
+                           dependencies=[base + 0, base + 2], data_size=data_size),
+            LoadInstruction(id=base + 4, target_register=base + 4,
+                            dependencies=[base + 3], data_size=data_size, vlane_ctx=2),
+            FMAInstruction(id=base + 5, target_register=base + 5,
+                           source_registers=[base + 3, base + 4], data_size=data_size),
+            StoreInstruction(id=base + 6, source_registers=[base + 5],
+                             data_size=data_size, vlane_ctx=1),
+        ]
+
+        ctx = row % num_contexts
+        for wrapper in row_insts:
+            wrapper.instruction.context_id = ctx
+        all_insts.extend(row_insts)
+
+    return [wrapper.instruction for wrapper in all_insts]
+
+
+def create_silu_instruction_stream(reg_width, num_rows, num_contexts=1, lane_strides=None) -> List[Instruction]:
+    """Create a SiLU activation instruction stream."""
+    data_size = reg_width
+    all_insts = []
+
+    for row in range(num_rows):
+        base = row * 100
+        row_insts = [
+            LoadInstruction(id=base + 0, target_register=base + 0,
+                            data_size=data_size, vlane_ctx=0),
+            FMAInstruction(id=base + 1, target_register=base + 1,
+                           source_registers=[base + 0], data_size=data_size),
+            EXP2Instruction(id=base + 2, target_register=base + 2,
+                            source_registers=[base + 1], data_size=data_size),
+            FMAInstruction(id=base + 3, target_register=base + 3,
+                           source_registers=[base + 2], data_size=data_size),
+            FMAInstruction(id=base + 4, target_register=base + 4,
+                           source_registers=[base + 3], data_size=data_size),
+            StoreInstruction(id=base + 5, source_registers=[base + 4],
+                             data_size=data_size, vlane_ctx=1),
+        ]
+
+        ctx = row % num_contexts
+        for wrapper in row_insts:
+            wrapper.instruction.context_id = ctx
+        all_insts.extend(row_insts)
+
+    return [wrapper.instruction for wrapper in all_insts]
+
+
+def create_rope_instruction_stream(reg_width, num_rows, num_contexts=1, lane_strides=None) -> List[Instruction]:
+    """Create a simplified RoPE instruction stream.
+
+    vlane2 is used for shared theta, vlane0 for input, and vlane1 for output.
+    The sin/cos polynomial expansion is abstracted as FMA work.
+    """
+    data_size = reg_width
+    all_insts = []
+
+    for row in range(num_rows):
+        base = row * 100
+        row_insts = [
+            LoadInstruction(id=base + 0, target_register=base + 0,
+                            data_size=data_size, vlane_ctx=2),
+            FMAInstruction(id=base + 1, target_register=base + 1,
+                           source_registers=[base + 0], data_size=data_size),
+            LoadInstruction(id=base + 2, target_register=base + 2,
+                            dependencies=[base + 1], data_size=data_size, vlane_ctx=0),
+            FMAInstruction(id=base + 3, target_register=base + 3,
+                           source_registers=[base + 1, base + 2], data_size=data_size),
+            FMAInstruction(id=base + 4, target_register=base + 4,
+                           source_registers=[base + 1, base + 2, base + 3],
+                           dependencies=[base + 1, base + 2, base + 3], data_size=data_size),
+            StoreInstruction(id=base + 5, source_registers=[base + 3, base + 4],
+                             data_size=data_size, vlane_ctx=1),
+        ]
+
+        ctx = row % num_contexts
+        for wrapper in row_insts:
+            wrapper.instruction.context_id = ctx
+        all_insts.extend(row_insts)
+
+    return [wrapper.instruction for wrapper in all_insts]
+
+
+def create_instruction_stream(kernel, reg_width, has_exp2_unit, num_heads, num_rows,
+                              seq_chunk_bits, num_contexts=1, lane_strides=None) -> List[Instruction]:
+    """Create a kernel-specific instruction stream with a common interface."""
+    if kernel == "softmax":
+        return create_softmax_instruction_stream(
+            reg_width, has_exp2_unit, num_heads, seq_chunk_bits,
+            num_contexts=num_contexts, lane_strides=lane_strides,
+        )
+    if kernel == "rmsnorm":
+        return create_rmsnorm_instruction_stream(
+            reg_width, num_rows, num_contexts=num_contexts, lane_strides=lane_strides,
+        )
+    if kernel == "silu":
+        return create_silu_instruction_stream(
+            reg_width, num_rows, num_contexts=num_contexts, lane_strides=lane_strides,
+        )
+    if kernel == "rope":
+        return create_rope_instruction_stream(
+            reg_width, num_rows, num_contexts=num_contexts, lane_strides=lane_strides,
+        )
+    raise ValueError(f"Unknown kernel: {kernel}")
+
+
+def run_kernel_simulation(args, kernel=None, num_contexts=None, issue_width=None, quiet=True) -> Tuple[Dict, VectorProcessor, List[Instruction]]:
+    """Build a config, run one simulation, and return results plus processor state."""
+    selected_kernel = kernel or args.kernel
+    selected_contexts = num_contexts if num_contexts is not None else args.num_contexts
+    selected_issue_width = issue_width if issue_width is not None else args.issue_width
+
+    execution_mode = ExecutionMode.IN_ORDER if args.execution_mode == "in-order" else ExecutionMode.OUT_OF_ORDER
+
+    if args.all_compute_widths is not None:
+        reduce_width = args.all_compute_widths
+        simple_width = args.all_compute_widths
+        complex_width = args.all_compute_widths
+    else:
+        reduce_width = args.reduce_compute_width
+        simple_width = args.simple_elementwise_width
+        complex_width = args.complex_elementwise_width
+
+    lane_strides = (
+        args.lane_stride_0,
+        args.lane_stride_1,
+        args.lane_stride_2,
+        args.lane_stride_3,
+    )
+
+    config = ProcessorConfig(
+        register_width=args.register_width,
+        reduce_compute_unit_width=reduce_width,
+        simple_elementwise_compute_unit_width=simple_width,
+        complex_elementwise_compute_unit_width=complex_width,
+        cache_bandwidth=args.cache_bandwidth,
+        chaining_enabled=args.chaining,
+        chaining_granularity=64,
+        execution_mode=execution_mode,
+        ooo_window_size=args.ooo_window_size,
+        issue_width=selected_issue_width,
+        num_contexts=selected_contexts,
+        lane_strides=lane_strides,
+    )
+
+    instructions = create_instruction_stream(
+        selected_kernel,
+        args.register_width,
+        args.exp2_unit,
+        args.num_heads,
+        args.num_rows,
+        args.seq_chunk_bits,
+        num_contexts=selected_contexts,
+        lane_strides=lane_strides,
+    )
+    for inst in instructions:
+        if inst.type in [InstructionType.LOAD, InstructionType.STORE] and inst.vlane_ctx >= len(lane_strides):
+            raise ValueError(f"Instruction {inst.id} has invalid vlane_ctx {inst.vlane_ctx}")
+
+    processor = VectorProcessor(config, quiet=quiet)
+    processor.load_instructions(instructions)
+    results = processor.simulate(max_cycles=args.max_cycles)
+
+    assert processor.get_outstanding_instruction_count() == 0
+    assert processor.get_outstanding_uop_count() == 0
+
+    return results, processor, instructions
+
+
+BENCHMARK_ALIASES = {
+    'lanes': 'num_contexts',
+    'lane_stride0': 'lane_stride_0',
+    'lane_stride1': 'lane_stride_1',
+    'lane_stride2': 'lane_stride_2',
+    'lane_stride3': 'lane_stride_3',
+    'lane-stride-0': 'lane_stride_0',
+    'lane-stride-1': 'lane_stride_1',
+    'lane-stride-2': 'lane_stride_2',
+    'lane-stride-3': 'lane_stride_3',
+    'issue-width': 'issue_width',
+    'num-contexts': 'num_contexts',
+    'num-heads': 'num_heads',
+    'num-rows': 'num_rows',
+    'seq-chunk-bits': 'seq_chunk_bits',
+    'register-width': 'register_width',
+    'cache-bandwidth': 'cache_bandwidth',
+}
+
+BENCHMARK_INT_FIELDS = {
+    'num_heads',
+    'num_rows',
+    'seq_chunk_bits',
+    'register_width',
+    'all_compute_widths',
+    'reduce_compute_width',
+    'simple_elementwise_width',
+    'complex_elementwise_width',
+    'cache_bandwidth',
+    'ooo_window_size',
+    'issue_width',
+    'num_contexts',
+    'lane_stride_0',
+    'lane_stride_1',
+    'lane_stride_2',
+    'lane_stride_3',
+    'max_cycles',
+}
+
+BENCHMARK_BOOL_FIELDS = {'exp2_unit', 'chaining', 'quiet'}
+BENCHMARK_METADATA_KEYS = {
+    'metadata',
+    'description',
+    'dependency_chain',
+    'latency_diagram',
+    'parameter_notes',
+    'lane_mapping',
+    'microarchitecture',
+    'workload_model',
+    'notes',
+}
+
+
+def _normalize_benchmark_key(key: str) -> str:
+    normalized = key.strip().replace('-', '_')
+    return BENCHMARK_ALIASES.get(normalized, normalized)
+
+
+def _parse_bool(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    normalized = str(value).strip().lower()
+    if normalized in {'1', 'true', 'yes', 'y', 'on'}:
+        return True
+    if normalized in {'0', 'false', 'no', 'n', 'off'}:
+        return False
+    raise ValueError(f"Invalid boolean value: {value}")
+
+
+def _md_cell(value) -> str:
+    return str(value).replace("|", "\\|")
+
+
+def _coerce_benchmark_value(key: str, value):
+    if value is None:
+        return None
+    if isinstance(value, str):
+        value = value.strip()
+        if value == "":
+            return None
+
+    if key in BENCHMARK_BOOL_FIELDS:
+        return _parse_bool(value)
+    if key in BENCHMARK_INT_FIELDS:
+        return int(value)
+    return value
+
+
+def _split_csv_sweep_value(value):
+    if not isinstance(value, str):
+        return value
+    if '|' in value:
+        return [part.strip() for part in value.split('|') if part.strip()]
+    return value
+
+
+def _expand_benchmark_case(raw_case: Dict) -> List[Dict]:
+    """Expand list-valued fields into concrete benchmark cases."""
+    normalized = {}
+    passthrough = {}
+    for raw_key, raw_value in raw_case.items():
+        key = _normalize_benchmark_key(str(raw_key))
+        if key in BENCHMARK_METADATA_KEYS:
+            passthrough[key] = raw_value
+            continue
+        value = _split_csv_sweep_value(raw_value)
+        if value is None or value == "":
+            continue
+        if isinstance(value, (list, tuple)):
+            values = [_coerce_benchmark_value(key, item) for item in value]
+            normalized[key] = [item for item in values if item is not None]
+        else:
+            coerced = _coerce_benchmark_value(key, value)
+            if coerced is not None:
+                normalized[key] = coerced
+
+    expanded = [{}]
+    for key, value in normalized.items():
+        values = value if isinstance(value, list) else [value]
+        next_expanded = []
+        for partial in expanded:
+            for item in values:
+                new_case = partial.copy()
+                new_case[key] = item
+                next_expanded.append(new_case)
+        expanded = next_expanded
+
+    if passthrough:
+        for case in expanded:
+            case.update(passthrough)
+
+    return expanded
+
+
+def _default_benchmark_cases() -> List[Dict]:
+    raw_cases = []
+    for kernel in ["softmax", "rmsnorm", "silu", "rope"]:
+        raw_cases.append({
+            'kernel': kernel,
+            'num_contexts': [1, 2, 4],
+            'issue_width': [1, 2],
+        })
+
+    cases = []
+    for raw_case in raw_cases:
+        cases.extend(_expand_benchmark_case(raw_case))
+    return cases
+
+
+def _load_yaml_benchmark_cases(path: str) -> Tuple[List[Dict], Dict]:
+    try:
+        import yaml
+    except ImportError as exc:
+        raise RuntimeError(
+            "YAML benchmark configs require PyYAML. Install it or use CSV."
+        ) from exc
+
+    with open(path, "r", encoding="utf-8") as f:
+        data = yaml.safe_load(f)
+
+    if data is None:
+        return [], {}
+    if isinstance(data, list):
+        return data, {}
+    if not isinstance(data, dict):
+        raise ValueError("YAML benchmark config must be a list or mapping")
+
+    defaults = data.get('defaults', {})
+    raw_cases = (
+        data.get('cases') or
+        data.get('benchmarks') or
+        data.get('sweeps') or
+        []
+    )
+    if not raw_cases:
+        raw_cases = [{key: value for key, value in data.items() if key != 'defaults'}]
+
+    return raw_cases, defaults
+
+
+def _load_csv_benchmark_cases(path: str) -> Tuple[List[Dict], Dict]:
+    with open(path, "r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(
+            line for line in f
+            if line.strip() and not line.lstrip().startswith("#")
+        )
+        if reader.fieldnames is None:
+            return [], {}
+        return [dict(row) for row in reader], {}
+
+
+def load_benchmark_cases(path: str) -> List[Dict]:
+    """Load benchmark cases from CSV or YAML and expand sweep fields."""
+    suffix = path.rsplit(".", 1)[-1].lower() if "." in path else ""
+    if suffix in {"yaml", "yml"}:
+        raw_cases, defaults = _load_yaml_benchmark_cases(path)
+    elif suffix == "csv":
+        raw_cases, defaults = _load_csv_benchmark_cases(path)
+    else:
+        raise ValueError("Benchmark config must use .csv, .yaml, or .yml")
+
+    cases = []
+    normalized_defaults = {}
+    for key, value in defaults.items():
+        normalized_key = _normalize_benchmark_key(str(key))
+        normalized_defaults[normalized_key] = _coerce_benchmark_value(normalized_key, value)
+
+    for raw_case in raw_cases:
+        if raw_case is None:
+            continue
+        if not isinstance(raw_case, dict):
+            raise ValueError(f"Benchmark case must be a mapping, got {type(raw_case).__name__}")
+        merged = normalized_defaults.copy()
+        merged.update(raw_case)
+        cases.extend(_expand_benchmark_case(merged))
+
+    return cases
+
+
+def _apply_benchmark_case(args, case: Dict):
+    case_args = copy.copy(args)
+    allowed_keys = set(vars(args).keys()) | {'name'}
+    for raw_key, raw_value in case.items():
+        key = _normalize_benchmark_key(str(raw_key))
+        if key == 'name' or key in BENCHMARK_METADATA_KEYS:
+            continue
+        if key not in allowed_keys:
+            raise ValueError(f"Unknown benchmark config field: {raw_key}")
+        setattr(case_args, key, raw_value)
+    return case_args
+
+
+def _run_benchmark_case(args, case: Dict) -> Dict:
+    case_args = _apply_benchmark_case(args, case)
+    results, processor, instructions = run_kernel_simulation(case_args, quiet=True)
+    metrics = processor.get_utilization_metrics()
+    metadata = case.get('metadata', {})
+    if not isinstance(metadata, dict):
+        metadata = {}
+    description = case.get('description') or metadata.get('description', '')
+    dependency_chain = case.get('dependency_chain') or metadata.get('dependency_chain', '')
+    latency_diagram = case.get('latency_diagram') or metadata.get('latency_diagram', '')
+    parameter_notes = case.get('parameter_notes') or metadata.get('parameter_notes', {})
+    return {
+        'name': str(case.get('name', '')),
+        'description': str(description),
+        'dependency_chain': str(dependency_chain),
+        'latency_diagram': str(latency_diagram),
+        'parameter_notes': parameter_notes,
+        'kernel': case_args.kernel,
+        'lanes': case_args.num_contexts,
+        'issue_width': case_args.issue_width,
+        'cycles': results['total_cycles'],
+        'speedup': 1.0,
+        'issue_util': metrics['issue_slot_utilization'],
+        'load_util': metrics['unit_active_pct']['load'],
+        'store_util': metrics['unit_active_pct']['store'],
+        'fma_util': metrics['unit_active_pct']['fma'],
+        'reduce_util': metrics['unit_active_pct']['reduce'],
+        'exp2_util': metrics['unit_active_pct']['exp2'],
+        'instruction_count': len(instructions),
+        'uop_count': len(processor.uops),
+    }
+
+
+def _annotate_speedups(rows: List[Dict]):
+    baseline_by_kernel = {}
+
+    for row in rows:
+        if row['lanes'] == 1 and row['issue_width'] == 2:
+            baseline_by_kernel.setdefault(row['kernel'], row['cycles'])
+
+    for row in rows:
+        baseline_by_kernel.setdefault(row['kernel'], row['cycles'])
+
+    for row in rows:
+        baseline_cycles = baseline_by_kernel[row['kernel']]
+        row['speedup'] = baseline_cycles / row['cycles'] if row['cycles'] else 0.0
+
+
+def run_benchmark_suite(args) -> str:
+    """Run a compact multi-kernel, multi-lane benchmark and return Markdown."""
+    if args.benchmark_config:
+        cases = load_benchmark_cases(args.benchmark_config)
+        source = args.benchmark_config
+    else:
+        cases = _default_benchmark_cases()
+        source = "built-in default sweep"
+
+    if not cases:
+        raise ValueError("No benchmark cases to run")
+
+    rows = [_run_benchmark_case(args, case) for case in cases]
+    _annotate_speedups(rows)
+    has_case_names = any(row['name'] for row in rows)
+    has_case_descriptions = any(row['description'] for row in rows)
+    has_case_notes = any(
+        row['description'] or row['dependency_chain'] or row['latency_diagram'] or row['parameter_notes']
+        for row in rows
+    )
+
+    lines = [
+        "# Multi-Kernel Benchmark Results",
+        "",
+        "Generated by `python3 softmax_simulator.py --benchmark`.",
+        "",
+        "## Configuration",
+        "",
+        f"- benchmark source: `{source}`",
+        f"- execution mode: `{args.execution_mode}`",
+        f"- register width: `{args.register_width}` bits",
+        f"- sequence chunk: `{args.seq_chunk_bits}` bits",
+        f"- rows per non-softmax kernel: `{args.num_rows}`",
+        f"- softmax heads: `{args.num_heads}`",
+        f"- cache bandwidth: `{args.cache_bandwidth}` bytes/cycle",
+        f"- compute widths: reduce/simple/complex = `{args.reduce_compute_width}`/`{args.simple_elementwise_width}`/`{args.complex_elementwise_width}` bits",
+        f"- lane strides: `{args.lane_stride_0}, {args.lane_stride_1}, {args.lane_stride_2}, {args.lane_stride_3}` bytes",
+        f"- exp2 unit for softmax: `{args.exp2_unit}`",
+        "",
+        "Speedup is normalized per kernel to `lanes=1, issue_width=2` when present; otherwise the first case for that kernel is used.",
+        "",
+        "## Summary",
+        "",
+    ]
+
+    if has_case_names and has_case_descriptions:
+        lines.extend([
+            "| case | description | kernel | lanes | issue width | cycles | speedup | issue util | load | store | fma | reduce | exp2 |",
+            "|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        ])
+    elif has_case_names:
+        lines.extend([
+            "| case | kernel | lanes | issue width | cycles | speedup | issue util | load | store | fma | reduce | exp2 |",
+            "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        ])
+    else:
+        lines.extend([
+            "| kernel | lanes | issue width | cycles | speedup | issue util | load | store | fma | reduce | exp2 |",
+            "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        ])
+
+    for row in rows:
+        row_cells = [
+            _md_cell(row['kernel']),
+            str(row['lanes']),
+            str(row['issue_width']),
+            str(row['cycles']),
+            f"{row['speedup']:.2f}x",
+            f"{row['issue_util']:.1f}%",
+            f"{row['load_util']:.1f}%",
+            f"{row['store_util']:.1f}%",
+            f"{row['fma_util']:.1f}%",
+            f"{row['reduce_util']:.1f}%",
+            f"{row['exp2_util']:.1f}%",
+        ]
+        if has_case_names and has_case_descriptions:
+            row_cells.insert(0, _md_cell(row['description']))
+            row_cells.insert(0, _md_cell(row['name']))
+        elif has_case_names:
+            row_cells.insert(0, _md_cell(row['name']))
+        lines.append("| " + " | ".join(row_cells) + " |")
+
+    lines.extend([
+        "",
+        "## Instruction Mix",
+        "",
+    ])
+
+    if has_case_names:
+        if has_case_descriptions:
+            lines.extend([
+                "| case | description | kernel | lanes | issue width | instructions | micro-ops |",
+                "|---|---|---|---:|---:|---:|---:|",
+            ])
+        else:
+            lines.extend([
+                "| case | kernel | lanes | issue width | instructions | micro-ops |",
+                "|---|---|---:|---:|---:|---:|",
+            ])
+    else:
+        lines.extend([
+            "| kernel | lanes | issue width | instructions | micro-ops |",
+            "|---|---:|---:|---:|---:|",
+        ])
+
+    for row in rows:
+        row_cells = [
+            _md_cell(row['kernel']),
+            str(row['lanes']),
+            str(row['issue_width']),
+            str(row['instruction_count']),
+            str(row['uop_count']),
+        ]
+        if has_case_names and has_case_descriptions:
+            row_cells.insert(0, _md_cell(row['description']))
+            row_cells.insert(0, _md_cell(row['name']))
+        elif has_case_names:
+            row_cells.insert(0, _md_cell(row['name']))
+        lines.append("| " + " | ".join(row_cells) + " |")
+
+    if has_case_notes:
+        lines.extend([
+            "",
+            "## Case Notes",
+            "",
+        ])
+        seen_notes = set()
+        for row in rows:
+            if not row['name']:
+                continue
+            if row['name'] in seen_notes:
+                continue
+            seen_notes.add(row['name'])
+            lines.append(f"- `{row['name']}`")
+            if row['description']:
+                lines.append(f"  - description: {row['description']}")
+            if row['parameter_notes']:
+                lines.append("  - parameters:")
+                notes = row['parameter_notes']
+                if isinstance(notes, dict):
+                    for key, value in notes.items():
+                        lines.append(f"    - {key}: {value}")
+                else:
+                    lines.append(f"    - {notes}")
+            if row['dependency_chain']:
+                lines.append(f"  - dependency chain: {row['dependency_chain']}")
+            if row['latency_diagram']:
+                lines.append("  - single-chain latency diagram:")
+                lines.append("    ```text")
+                for line in row['latency_diagram'].splitlines():
+                    lines.append(f"    {line}")
+                lines.append("    ```")
+
+    return "\n".join(lines) + "\n"
 
 
 def parse_arguments():
@@ -1177,10 +1882,24 @@ def parse_arguments():
     )
 
     parser.add_argument(
+        "--kernel",
+        choices=["softmax", "rmsnorm", "silu", "rope"],
+        default="softmax",
+        help="Kernel instruction stream to simulate"
+    )
+
+    parser.add_argument(
         "--num-heads",
         type=int,
         default=8,
-        help="The number of attention heads",
+        help="The number of attention heads for softmax",
+    )
+
+    parser.add_argument(
+        "--num-rows",
+        type=int,
+        default=8,
+        help="The number of independent rows for rmsnorm, silu, and rope",
     )
 
     parser.add_argument(
@@ -1269,6 +1988,58 @@ def parse_arguments():
     )
 
     parser.add_argument(
+        "--lane-stride-0",
+        type=int,
+        default=0,
+        help="vlane0 stride in bytes"
+    )
+
+    parser.add_argument(
+        "--lane-stride-1",
+        type=int,
+        default=0,
+        help="vlane1 stride in bytes"
+    )
+
+    parser.add_argument(
+        "--lane-stride-2",
+        type=int,
+        default=0,
+        help="vlane2 stride in bytes"
+    )
+
+    parser.add_argument(
+        "--lane-stride-3",
+        type=int,
+        default=0,
+        help="vlane3 stride in bytes"
+    )
+
+    parser.add_argument(
+        "--max-cycles",
+        type=int,
+        default=100000,
+        help="Maximum simulation cycles before timeout"
+    )
+
+    parser.add_argument(
+        "--benchmark",
+        action="store_true",
+        help="Run all kernels across 1/2/4 lanes and issue_width 1/2"
+    )
+
+    parser.add_argument(
+        "--benchmark-config",
+        help="CSV/YAML benchmark config. YAML supports defaults, metadata, and list-valued sweeps"
+    )
+
+    parser.add_argument(
+        "--benchmark-output",
+        default="plans/benchmark_results.md",
+        help="Markdown output path for --benchmark"
+    )
+
+    parser.add_argument(
         "--quiet",
         action="store_true",
         help="Only output total cycle count"
@@ -1281,73 +2052,55 @@ def main():
     """Example usage of the softmax simulator"""
     # Parse command line arguments
     args = parse_arguments()
-    
-    # Convert string execution mode to enum
-    execution_mode = ExecutionMode.IN_ORDER if args.execution_mode == "in-order" else ExecutionMode.OUT_OF_ORDER
+    if args.benchmark or args.benchmark_config:
+        benchmark_md = run_benchmark_suite(args)
+        benchmark_path = args.benchmark_output
+        with open(benchmark_path, "w", encoding="utf-8") as f:
+            f.write(benchmark_md)
+        if not args.quiet:
+            print(benchmark_md, end="")
+            print(f"Wrote benchmark results to {benchmark_path}")
+        else:
+            print(benchmark_path)
+        return
 
-    if args.all_compute_widths is not None:
-        reduce_width = args.all_compute_widths
-        simple_width = args.all_compute_widths
-        complex_width = args.all_compute_widths
-    else:
-        reduce_width = args.reduce_compute_width
-        simple_width = args.simple_elementwise_width
-        complex_width = args.complex_elementwise_width
-    
-    # Create processor configuration from arguments
-    config = ProcessorConfig(
-        register_width=args.register_width,
-        reduce_compute_unit_width=reduce_width,
-        simple_elementwise_compute_unit_width=simple_width,
-        complex_elementwise_compute_unit_width=complex_width,
-        cache_bandwidth=args.cache_bandwidth,
-        chaining_enabled=args.chaining,
-        chaining_granularity=64,  # Keep default granularity
-        execution_mode=execution_mode,
-        ooo_window_size=args.ooo_window_size,
-        issue_width=args.issue_width,
-        num_contexts=args.num_contexts
-    )
-    
     quiet = args.quiet
+    results, processor, instructions = run_kernel_simulation(args, quiet=quiet)
 
     if not quiet:
+        execution_mode = ExecutionMode.IN_ORDER if args.execution_mode == "in-order" else ExecutionMode.OUT_OF_ORDER
+        if args.all_compute_widths is not None:
+            reduce_width = args.all_compute_widths
+            simple_width = args.all_compute_widths
+            complex_width = args.all_compute_widths
+        else:
+            reduce_width = args.reduce_compute_width
+            simple_width = args.simple_elementwise_width
+            complex_width = args.complex_elementwise_width
+
         print("RISC-V Vector Processor Softmax Simulator")
         print("=" * 50)
-        print(f"Configuration:")
-        print(f"  Register width: {config.register_width} bits")
-        print(f"  Reduce compute unit width: {config.reduce_compute_unit_width} bits")
-        print(f"  Simple elementwise compute unit width: {config.simple_elementwise_compute_unit_width} bits")
-        print(f"  Complex elementwise compute unit width: {config.complex_elementwise_compute_unit_width} bits")
-        print(f"  Cache bandwidth: {config.cache_bandwidth} bytes/cycle")
-        print(f"  Execution mode: {config.execution_mode.value}")
-        print(f"  Chaining: {'enabled' if config.chaining_enabled else 'disabled'}")
-        if config.chaining_enabled:
-            print(f"  Chaining granularity: {config.chaining_granularity} bytes")
+        print("Configuration:")
+        print(f"  Kernel: {args.kernel}")
+        print(f"  Register width: {args.register_width} bits")
+        print(f"  Reduce compute unit width: {reduce_width} bits")
+        print(f"  Simple elementwise compute unit width: {simple_width} bits")
+        print(f"  Complex elementwise compute unit width: {complex_width} bits")
+        print(f"  Cache bandwidth: {args.cache_bandwidth} bytes/cycle")
+        print(f"  Execution mode: {execution_mode.value}")
+        print(f"  Chaining: {'enabled' if args.chaining else 'disabled'}")
+        print(f"  num_contexts: {args.num_contexts}")
+        print(f"  lane strides: ({args.lane_stride_0}, {args.lane_stride_1}, {args.lane_stride_2}, {args.lane_stride_3})")
         print()
 
-    # Create processor
-    processor = VectorProcessor(config, quiet=quiet)
-
-    # Load sample softmax instruction stream
-    instructions = create_softmax_instruction_stream(args.register_width, args.exp2_unit, args.num_heads, args.seq_chunk_bits, num_contexts=args.num_contexts)
-    processor.load_instructions(instructions)
-
-    if not quiet:
-        print(f"Loaded {len(instructions)} instructions for softmax computation")
+        print(f"Loaded {len(instructions)} instructions for {args.kernel} computation")
         print("Instructions:")
         for inst in instructions:
-            deps_str = f"depends on {list(inst.dependencies)}" if inst.dependencies else "no dependencies"
-            print(f"  {inst.id}: {inst.type.value} ({inst.data_size} bytes, {deps_str})")
+            deps_str = f"depends on {sorted(list(inst.dependencies))}" if inst.dependencies else "no dependencies"
+            print(f"  {inst.id}: {inst.type.value} ({inst.data_size} bytes, ctx {inst.context_id}, "
+                  f"vlane{inst.vlane_ctx}, {deps_str})")
         print()
 
-    # Run simulation with longer timeout now
-    results = processor.simulate(max_cycles=100000)
-
-    assert processor.get_outstanding_instruction_count() == 0
-    assert processor.get_outstanding_uop_count() == 0
-
-    if not quiet:
         print("Instruction Timeline:")
         for inst_result in results['instructions']:
             issue_str = f"issue:{inst_result['issue_cycle']}" if inst_result['issue_cycle'] >= 0 else "issue:N/A"
@@ -1359,28 +2112,32 @@ def main():
         print(f"Generated {len(results['uops'])} micro-operations")
         print()
 
-        # Print detailed uop timeline
         print("Micro-operation (uop) Timeline:")
         for uop_result in results['uops']:
             inst_id = uop_result['instruction_id']
             uop_id = uop_result['uop_id']
             uop_type = uop_result['type']
+            context_id = uop_result['context_id']
+            vlane_ctx = uop_result['vlane_ctx']
+            address = uop_result['address']
             start_cycle = uop_result['start_cycle']
             complete_cycle = uop_result['complete_cycle']
             execution_time = uop_result['execution_time']
 
+            address_str = f", addr {address}" if address is not None else ""
             print(f"  uop {inst_id}.{uop_id} ({uop_type}): "
-                  f"cycles {start_cycle}-{complete_cycle} "
+                  f"cycles {start_cycle}-{complete_cycle}, ctx {context_id}, vlane{vlane_ctx}{address_str} "
                   f"(duration: {execution_time})")
         print()
 
-        # Display ASCII visualization
         processor.visualize_execution()
         print()
-
-        # Display uop-level ASCII visualization
         processor.visualize_uop_execution()
         print()
+
+    if quiet:
+        print(f"Total execution time: {results['total_cycles']} cycles")
+        return
 
     print(f"Total execution time: {results['total_cycles']} cycles")
     if results['instructions']:
