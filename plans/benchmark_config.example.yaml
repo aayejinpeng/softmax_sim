@@ -51,24 +51,54 @@
 # plans/benchmark_instruction_table.example.csv
 
 defaults:
-  execution_mode: [in-order, out-of-order]
-  register_renaming: [false, true]
-  chaining: false
-  issue_queue_window: 16
-  ooo_scheduler_window_size: 8
-  lane_stride_0: 256
-  lane_stride_1: 256
-  lane_stride_2: 0
-  lane_stride_3: 256
+  chaining: true
 
 hardware_configs:
-  - name: vw512_bw64
+  - name: vw512_bw64_inorder
+    execution_mode: in-order
     register_width: 512
     cache_bandwidth: 64  # bytes per cycle
     all_compute_widths: 512
-  - name: vw1024_bw128
-    register_width: 1024
-    cache_bandwidth: 128
+    baseline: true
+  - name: vw512_bw64_ooo_norename_8iq_8sch
+    execution_mode: out-of-order
+    register_renaming: false
+    issue_queue_window: 8
+    ooo_scheduler_window_size: 8
+    register_width: 512
+    cache_bandwidth: 64  # bytes per cycle
+    all_compute_widths: 512
+  - name: vw512_bw64_ooo_norename_16iq_16sch
+    execution_mode: out-of-order
+    register_renaming: false
+    issue_queue_window: 16
+    ooo_scheduler_window_size: 16
+    register_width: 512
+    cache_bandwidth: 64  # bytes per cycle
+    all_compute_widths: 512
+  - name: vw512_bw64_ooo_norename_32iq_32sch
+    execution_mode: out-of-order
+    register_renaming: false
+    issue_queue_window: 32
+    ooo_scheduler_window_size: 32
+    register_width: 512
+    cache_bandwidth: 64  # bytes per cycle
+    all_compute_widths: 512
+  - name: vw512_bw64_ooo_rename_32iq_32sch
+    execution_mode: out-of-order
+    register_renaming: true
+    issue_queue_window: 32
+    ooo_scheduler_window_size: 32
+    register_width: 512
+    cache_bandwidth: 64  # bytes per cycle
+    all_compute_widths: 512
+  - name: vw512_bw64_ooo_rename_64iq_64sch
+    execution_mode: out-of-order
+    register_renaming: true
+    issue_queue_window: 64
+    ooo_scheduler_window_size: 64
+    register_width: 512
+    cache_bandwidth: 64  # bytes per cycle
     all_compute_widths: 512
 
 cases:
