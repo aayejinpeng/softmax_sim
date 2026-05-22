@@ -7,7 +7,9 @@ with configurable architecture parameters and instruction scheduling.
 """
 
 from enum import Enum
+import concurrent.futures
 import csv
+import os
 import re
 from typing import List, Dict, Optional, Set, Tuple
 from dataclasses import dataclass
@@ -55,8 +57,16 @@ class ProcessorConfig:
     store_latency: int = 10
     exp2_latency: int = 20
     
-    # Out-of-order execution window size
-    ooo_window_size: int = 16
+    # Oldest not-yet-completed uops visible to the issue queue.
+    issue_queue_window: int = 10
+
+    # Number of not-yet-issued uops the out-of-order scheduler may choose from
+    # inside the issue queue window.
+    ooo_scheduler_window_size: int = 16
+
+    # When disabled, repeated logical registers within a context create
+    # RAW/WAR/WAW dependencies across independent heads or rows.
+    register_renaming: bool = True
 
     # Issue width (max μops per cycle)
     issue_width: int = 2
@@ -75,6 +85,10 @@ class ProcessorConfig:
             raise ValueError("Simple elementwise compute unit width cannot exceed register width")
         if self.complex_elementwise_compute_unit_width > self.register_width:
             raise ValueError("Complex elementwise compute unit width cannot exceed register width")
+        if self.issue_queue_window < 1:
+            raise ValueError("Issue queue window must be at least 1")
+        if self.ooo_scheduler_window_size < 1:
+            raise ValueError("Out-of-order scheduler window size must be at least 1")
         
         valid_reg_widths = [512, 1024, 2048, 4096]
         valid_compute_widths = [128, 256, 512, 1024]
@@ -109,6 +123,9 @@ class Instruction:
     dependencies: Set[int]  # IDs of instructions this depends on
     data_size: int  # Size of data to process (in bytes)
     target_register: Optional[int] = None
+    source_registers: Tuple[int, ...] = ()
+    logical_target_register: Optional[int] = None
+    logical_source_registers: Tuple[int, ...] = ()
 
     # Chaining support
     element_wise_src: bool = False
@@ -134,13 +151,19 @@ class LoadInstruction:
     """Simplified wrapper for creating LOAD instructions"""
     
     def __init__(self, id: int, target_register: int, dependencies: Set[int] = None,
-                 data_size: int = 256, vlane_ctx: int = 0):
+                 data_size: int = 256, vlane_ctx: int = 0,
+                 logical_target_register: int = None):
+        if logical_target_register is None:
+            logical_target_register = target_register
         self.instruction = Instruction(
             id=id,
             type=InstructionType.LOAD,
             dependencies=_dependency_set(dependencies),
             data_size=data_size,  # Default 2048 bits = 256 bytes
             target_register=target_register,
+            source_registers=(),
+            logical_target_register=logical_target_register,
+            logical_source_registers=(),
             element_wise_dest=True,
             vlane_ctx=vlane_ctx,
         )
@@ -153,12 +176,17 @@ class ReduceInstruction:
     """Simplified wrapper for creating REDUCE instructions"""
     
     def __init__(self, id: int, target_register: int, source_registers: List[int], 
-                 dependencies: Set[int] = None, data_size: int = 256):
+                 dependencies: Set[int] = None, data_size: int = 256,
+                 logical_target_register: int = None, logical_source_registers: List[int] = None):
         # If dependencies not explicitly provided, derive from source_registers
         if dependencies is None:
             dependencies = set(source_registers) if source_registers else set()
         else:
             dependencies = _dependency_set(dependencies)
+        if logical_target_register is None:
+            logical_target_register = target_register
+        if logical_source_registers is None:
+            logical_source_registers = source_registers
         
         self.instruction = Instruction(
             id=id,
@@ -166,6 +194,9 @@ class ReduceInstruction:
             dependencies=dependencies,
             data_size=data_size,  # Default 2048 bits = 256 bytes
             target_register=target_register,
+            source_registers=tuple(source_registers or ()),
+            logical_target_register=logical_target_register,
+            logical_source_registers=tuple(logical_source_registers or ()),
             element_wise_src=True,
         )
         # Reduce instruction specific
@@ -180,12 +211,17 @@ class FMAInstruction:
     """Simplified wrapper for creating FMA instructions"""
     
     def __init__(self, id: int, target_register: int, source_registers: List[int],
-                 dependencies: Set[int] = None, data_size: int = 256):
+                 dependencies: Set[int] = None, data_size: int = 256,
+                 logical_target_register: int = None, logical_source_registers: List[int] = None):
         # If dependencies not explicitly provided, derive from source_registers
         if dependencies is None:
             dependencies = set(source_registers) if source_registers else set()
         else:
             dependencies = _dependency_set(dependencies)
+        if logical_target_register is None:
+            logical_target_register = target_register
+        if logical_source_registers is None:
+            logical_source_registers = source_registers
         
         self.instruction = Instruction(
             id=id,
@@ -193,6 +229,9 @@ class FMAInstruction:
             dependencies=dependencies,
             data_size=data_size,  # Default 2048 bits = 256 bytes
             target_register=target_register,
+            source_registers=tuple(source_registers or ()),
+            logical_target_register=logical_target_register,
+            logical_source_registers=tuple(logical_source_registers or ()),
             element_wise_src=True,
             element_wise_dest=True,
         )
@@ -205,12 +244,17 @@ class EXP2Instruction:
     """Simplified wrapper for creating EXP2 instructions"""
     
     def __init__(self, id: int, target_register: int, source_registers: List[int],
-                 dependencies: Set[int] = None, data_size: int = 256):
+                 dependencies: Set[int] = None, data_size: int = 256,
+                 logical_target_register: int = None, logical_source_registers: List[int] = None):
         # If dependencies not explicitly provided, derive from source_registers
         if dependencies is None:
             dependencies = set(source_registers) if source_registers else set()
         else:
             dependencies = _dependency_set(dependencies)
+        if logical_target_register is None:
+            logical_target_register = target_register
+        if logical_source_registers is None:
+            logical_source_registers = source_registers
         
         self.instruction = Instruction(
             id=id,
@@ -218,6 +262,9 @@ class EXP2Instruction:
             dependencies=dependencies,
             data_size=data_size,  # Default 2048 bits = 256 bytes
             target_register=target_register,
+            source_registers=tuple(source_registers or ()),
+            logical_target_register=logical_target_register,
+            logical_source_registers=tuple(logical_source_registers or ()),
             element_wise_src=True,
             element_wise_dest=True,
         )
@@ -231,12 +278,14 @@ class StoreInstruction:
     
     def __init__(self, id: int, source_registers: List[int], 
                  dependencies: Set[int] = None, target_mem: int = None, data_size: int = 256,
-                 vlane_ctx: int = 0):
+                 vlane_ctx: int = 0, logical_source_registers: List[int] = None):
         # If dependencies not explicitly provided, derive from source_registers
         if dependencies is None:
             dependencies = set(source_registers) if source_registers else set()
         else:
             dependencies = _dependency_set(dependencies)
+        if logical_source_registers is None:
+            logical_source_registers = source_registers
         
         self.instruction = Instruction(
             id=id,
@@ -244,6 +293,9 @@ class StoreInstruction:
             dependencies=dependencies,
             data_size=data_size,  # Default 2048 bits = 256 bytes
             target_register=target_mem,
+            source_registers=tuple(source_registers or ()),
+            logical_target_register=None,
+            logical_source_registers=tuple(logical_source_registers or ()),
             element_wise_src=True,
             vlane_ctx=vlane_ctx,
         )
@@ -481,6 +533,10 @@ class VectorProcessor:
         self.instructions: Dict[int, Instruction] = {}
         self.uops: List[MicroOp] = []
         self.instruction_uop_map: Dict[int, List[int]] = {}  # instruction_id -> uop_ids
+        self.context_uop_indices: Dict[int, List[int]] = {}
+        self.context_issue_cursors: Dict[int, int] = {}
+        self.instruction_remaining_uops: Dict[int, int] = {}
+        self.remaining_instructions = 0
         
         # Execution units (simplified model)
         self.execution_units = {
@@ -512,6 +568,8 @@ class VectorProcessor:
         self.instructions = {inst.id: inst for inst in instructions}
         self.uops = []
         self.instruction_uop_map = {}
+        self.context_uop_indices = {ctx: [] for ctx in range(self.config.num_contexts)}
+        self.remaining_instructions = len(self.instructions)
         
         # Split all instructions into uops
         uop_offset = 0
@@ -528,10 +586,42 @@ class VectorProcessor:
         
         # Fix memory instruction dependencies
         self._fix_memory_dependencies()
+
+        # Model false register dependencies when physical register renaming is absent.
+        if not self.config.register_renaming:
+            self._add_register_hazard_dependencies()
         
         # Establish chaining dependencies if enabled
         if self.config.chaining_enabled:
             self._establish_chaining_dependencies()
+
+        for idx, uop in enumerate(self.uops):
+            self.context_uop_indices.setdefault(uop.context_id, []).append(idx)
+
+    def _add_register_hazard_dependencies(self):
+        """Add WAR/WAW/RAW ordering constraints without register renaming."""
+        last_writer = {}
+        last_readers = {}
+
+        for instruction in self.instructions.values():
+            ctx = instruction.context_id
+            source_regs = tuple(instruction.logical_source_registers)
+            target_reg = instruction.logical_target_register
+
+            for reg in source_regs:
+                writer = last_writer.get((ctx, reg))
+                if writer is not None:
+                    instruction.dependencies.add(writer)
+                last_readers.setdefault((ctx, reg), set()).add(instruction.id)
+
+            if target_reg is not None:
+                reg_key = (ctx, target_reg)
+                writer = last_writer.get(reg_key)
+                if writer is not None:
+                    instruction.dependencies.add(writer)
+                instruction.dependencies.update(last_readers.get(reg_key, set()))
+                last_writer[reg_key] = instruction.id
+                last_readers[reg_key] = set()
     
     def _fix_reduce_dependencies(self):
         """Fix dependencies for reduce instruction uops after all uops are loaded"""
@@ -655,6 +745,13 @@ class VectorProcessor:
             uop.issued = uop.started = uop.completed = False
             uop.start_cycle = uop.complete_cycle = -1
             uop.ready_elements = 0
+
+        self.context_issue_cursors = {ctx: 0 for ctx in range(self.config.num_contexts)}
+        self.instruction_remaining_uops = {
+            inst_id: len(uop_ids)
+            for inst_id, uop_ids in self.instruction_uop_map.items()
+        }
+        self.remaining_instructions = len(self.instructions)
         
         # Reset outstanding counts
         self.outstanding_instruction_count = 0
@@ -724,64 +821,89 @@ class VectorProcessor:
                     
                     # Update outstanding uop count
                     self.outstanding_uop_count -= 1
+
+                    self._complete_uop(uop)
             
             # Remove completed uops
             for uop_info in completed_uops:
                 self.execution_units[inst_type].remove(uop_info)
+
+    def _complete_uop(self, uop: MicroOp):
+        remaining = self.instruction_remaining_uops.get(uop.instruction_id, 0) - 1
+        self.instruction_remaining_uops[uop.instruction_id] = remaining
+        if remaining != 0:
+            return
+
+        instruction = self.instructions[uop.instruction_id]
+        if instruction.completed:
+            return
+
+        uop_ids = self.instruction_uop_map[instruction.id]
+        instruction.completed = True
+        instruction.complete_cycle = max(self.uops[uop_id].complete_cycle for uop_id in uop_ids)
+        if instruction.start_cycle == -1:
+            instruction.start_cycle = min(self.uops[uop_id].start_cycle for uop_id in uop_ids)
+        self.outstanding_instruction_count -= 1
+        self.remaining_instructions -= 1
     
-    def _issue_in_order(self):
-        """Issue uops in order, per context, with shared bandwidth"""
-        simulated_window_size = 10
+    def _issue_queue_window(self, ctx: int) -> List[int]:
+        """Return the oldest not-yet-completed uops visible to issue."""
+        window = []
+        ctx_indices = self.context_uop_indices.get(ctx, [])
+        cursor = self.context_issue_cursors.get(ctx, 0)
+
+        while cursor < len(ctx_indices) and self.uops[ctx_indices[cursor]].completed:
+            cursor += 1
+        self.context_issue_cursors[ctx] = cursor
+
+        for idx in ctx_indices[cursor:]:
+            uop = self.uops[idx]
+            if uop.completed:
+                continue
+            window.append(idx)
+            if len(window) >= self.config.issue_queue_window:
+                break
+        return window
+
+    def _issue_from_candidates(self, candidate_indices: List[int], max_to_issue: int) -> int:
+        issued = 0
+        for idx in candidate_indices:
+            if issued >= max_to_issue:
+                break
+            uop = self.uops[idx]
+            if not uop.issued and self._can_issue_uop(uop):
+                if self._issue_uop(idx):
+                    issued += 1
+        return issued
+
+    def _scheduler_candidates(self, ctx: int, scheduler_window_size: int) -> List[int]:
+        """Return the oldest not-yet-issued uops inside the visible issue queue."""
+        candidates = []
+        for idx in self._issue_queue_window(ctx):
+            if self.uops[idx].issued:
+                continue
+            candidates.append(idx)
+            if len(candidates) >= scheduler_window_size:
+                break
+        return candidates
+
+    def _issue_with_scheduler_window(self, scheduler_window_size: int):
+        """Issue ready uops from scheduler candidates, sharing issue width globally."""
         total_issued = 0
         for ctx in range(self.config.num_contexts):
-            issued_count = 0
-            incompleted_uop_count = 0
-            for uop in self.uops:
-                if uop.context_id != ctx:
-                    continue
-                if not uop.issued and self._can_issue_uop(uop):
-                    if self._issue_uop(uop):
-                        total_issued += 1
-                        issued_count += 1
-                        if total_issued >= self.config.issue_width:
-                            return
-                if not uop.completed:
-                    incompleted_uop_count += 1
-                if incompleted_uop_count >= simulated_window_size:
-                    break
+            candidate_indices = self._scheduler_candidates(ctx, scheduler_window_size)
+            remaining_issue_slots = self.config.issue_width - total_issued
+            total_issued += self._issue_from_candidates(candidate_indices, remaining_issue_slots)
+            if total_issued >= self.config.issue_width:
+                return
+
+    def _issue_in_order(self):
+        """Issue only the oldest not-yet-issued uop in the visible issue queue."""
+        self._issue_with_scheduler_window(1)
 
     def _issue_out_of_order(self):
-        """Issue uops out of order within a window, per context, with shared bandwidth"""
-        total_issued = 0
-        window_size = min(self.config.ooo_window_size, len(self.uops))
-
-        for ctx in range(self.config.num_contexts):
-            issued_count = 0
-            # Find the first unissued uop in this context
-            first_unissued = 0
-            ctx_uop_indices = [i for i, u in enumerate(self.uops) if u.context_id == ctx]
-            if not ctx_uop_indices:
-                continue
-
-            first_unissued = 0
-            while (first_unissued < len(ctx_uop_indices) and
-                   self.uops[ctx_uop_indices[first_unissued]].issued):
-                first_unissued += 1
-
-            if first_unissued >= len(ctx_uop_indices):
-                continue
-
-            # Look within the window for issuable uops
-            window_end = min(first_unissued + window_size, len(ctx_uop_indices))
-
-            for idx in range(first_unissued, window_end):
-                uop = self.uops[ctx_uop_indices[idx]]
-                if not uop.issued and self._can_issue_uop(uop):
-                    if self._issue_uop(uop):
-                        total_issued += 1
-                        issued_count += 1
-                        if total_issued >= self.config.issue_width:
-                            return
+        """Issue ready uops from the oldest scheduler candidates in the issue queue."""
+        self._issue_with_scheduler_window(self.config.ooo_scheduler_window_size)
     
     def _can_issue_uop(self, uop: MicroOp) -> bool:
         """Check if a uop can be issued"""
@@ -798,8 +920,9 @@ class VectorProcessor:
         
         return True
     
-    def _issue_uop(self, uop: MicroOp) -> bool:
+    def _issue_uop(self, uop_index: int) -> bool:
         """Try to issue a uop to an execution unit"""
+        uop = self.uops[uop_index]
         # Check resource availability for memory operations
         if uop.type in [InstructionType.LOAD, InstructionType.STORE]:
             # Each memory uop size is typically equal to cache_bandwidth (except possibly the last one)
@@ -834,7 +957,13 @@ class VectorProcessor:
         uop.start_cycle = self.current_cycle
         complete_cycle = self.current_cycle + uop.latency
         
-        self.execution_units[uop.type].append((self.uops.index(uop), complete_cycle))
+        self.execution_units[uop.type].append((uop_index, complete_cycle))
+
+        instruction = self.instructions[uop.instruction_id]
+        if instruction.issue_cycle == -1:
+            instruction.issue_cycle = self.current_cycle
+            instruction.issued = True
+            self.outstanding_instruction_count += 1
         
         # Update outstanding uop count
         self.outstanding_uop_count += 1
@@ -870,32 +999,7 @@ class VectorProcessor:
     
     def _all_instructions_completed(self) -> bool:
         """Check if all instructions have completed"""
-        # First update instruction completion status
-        for instruction in self.instructions.values():
-            if not instruction.completed:
-                uop_ids = self.instruction_uop_map[instruction.id]
-                # Set issue_cycle when first uop is issued
-                if instruction.issue_cycle == -1:
-                    issued_uops = [self.uops[uop_id] for uop_id in uop_ids if self.uops[uop_id].issued]
-                    if issued_uops:
-                        instruction.issue_cycle = min(uop.start_cycle for uop in issued_uops)
-                        instruction.issued = True
-                        
-                        # Update outstanding instruction count
-                        self.outstanding_instruction_count += 1
-                
-                if all(self.uops[uop_id].completed for uop_id in uop_ids):
-                    instruction.completed = True
-                    instruction.complete_cycle = max(self.uops[uop_id].complete_cycle 
-                                                   for uop_id in uop_ids)
-                    if instruction.start_cycle == -1:
-                        instruction.start_cycle = min(self.uops[uop_id].start_cycle 
-                                                    for uop_id in uop_ids)
-                    
-                    # Update outstanding instruction count
-                    self.outstanding_instruction_count -= 1
-        
-        return all(instruction.completed for instruction in self.instructions.values())
+        return self.remaining_instructions == 0
     
     def _generate_results(self) -> Dict:
         """Generate simulation results"""
@@ -1150,17 +1254,23 @@ def create_softmax_instruction_stream(reg_width, has_exp2_unit, num_heads, seq_c
         head_id = h*1000
         per_head_insts = []
 
+        def lreg(chunk: int, slot: int) -> int:
+            return chunk * 100 + slot
+
         max_reduce_fake_dest = []
         for i in range(explicit_split_count):
             dep_group_id = head_id + i*100
             per_head_insts += [
                 # Load input vector
                 LoadInstruction(id=dep_group_id + 0, target_register=dep_group_id + 0,
-                                data_size=reg_width, vlane_ctx=0),
+                                data_size=reg_width, vlane_ctx=0,
+                                logical_target_register=lreg(i, 0)),
                 
                 # Find maximum value
                 ReduceInstruction(id=dep_group_id + 1, target_register=dep_group_id + 1, source_registers=[dep_group_id + 0], 
-                                data_size=reg_width),
+                                data_size=reg_width,
+                                logical_target_register=lreg(i, 1),
+                                logical_source_registers=[lreg(i, 0)]),
             ]
             max_reduce_fake_dest.append(dep_group_id + 1)
 
@@ -1172,21 +1282,35 @@ def create_softmax_instruction_stream(reg_width, has_exp2_unit, num_heads, seq_c
                 per_head_insts += [
                     # Subtract max from all elements (x - max)
                     LoadInstruction(id=dep_group_id + 2, target_register=dep_group_id + 2,
-                                dependencies=max_reduce_fake_dest, data_size=reg_width, vlane_ctx=0),
+                                dependencies=max_reduce_fake_dest, data_size=reg_width, vlane_ctx=0,
+                                logical_target_register=lreg(i, 2)),
                     FMAInstruction(id=dep_group_id + 3, target_register=dep_group_id + 3, source_registers=[dep_group_id + 2],
-                                data_size=reg_width),
+                                data_size=reg_width,
+                                logical_target_register=lreg(i, 3),
+                                logical_source_registers=[lreg(i, 2)]),
                     FMAInstruction(id=dep_group_id + 4, target_register=dep_group_id + 4, source_registers=[dep_group_id + 3],
-                                data_size=reg_width),
+                                data_size=reg_width,
+                                logical_target_register=lreg(i, 4),
+                                logical_source_registers=[lreg(i, 3)]),
                     FMAInstruction(id=dep_group_id + 5, target_register=dep_group_id + 5, source_registers=[dep_group_id + 4],
-                                data_size=reg_width),
+                                data_size=reg_width,
+                                logical_target_register=lreg(i, 5),
+                                logical_source_registers=[lreg(i, 4)]),
                     FMAInstruction(id=dep_group_id + 6, target_register=dep_group_id + 6, source_registers=[dep_group_id + 5],
-                                data_size=reg_width),
+                                data_size=reg_width,
+                                logical_target_register=lreg(i, 6),
+                                logical_source_registers=[lreg(i, 5)]),
                     FMAInstruction(id=dep_group_id + 7, target_register=dep_group_id + 7, source_registers=[dep_group_id + 6],
-                                data_size=reg_width),
+                                data_size=reg_width,
+                                logical_target_register=lreg(i, 7),
+                                logical_source_registers=[lreg(i, 6)]),
                     FMAInstruction(id=dep_group_id + 8, target_register=dep_group_id + 8, source_registers=[dep_group_id + 7],
-                                data_size=reg_width),
+                                data_size=reg_width,
+                                logical_target_register=lreg(i, 8),
+                                logical_source_registers=[lreg(i, 7)]),
                     StoreInstruction(id=dep_group_id + 9, target_mem=dep_group_id + 9,
-                                     source_registers=[dep_group_id + 8], data_size=reg_width, vlane_ctx=3)
+                                     source_registers=[dep_group_id + 8], data_size=reg_width, vlane_ctx=3,
+                                     logical_source_registers=[lreg(i, 8)])
                 ]
         else:
             for i in range(explicit_split_count):
@@ -1194,11 +1318,15 @@ def create_softmax_instruction_stream(reg_width, has_exp2_unit, num_heads, seq_c
                 per_head_insts += [
                     # Compute exp2(x - max)
                     LoadInstruction(id=dep_group_id + 2, target_register=dep_group_id + 2, dependencies=max_reduce_fake_dest,
-                                    data_size=reg_width, vlane_ctx=0),
+                                    data_size=reg_width, vlane_ctx=0,
+                                    logical_target_register=lreg(i, 2)),
                     EXP2Instruction(id=dep_group_id + 8, target_register=dep_group_id + 8, source_registers=[dep_group_id + 2],
-                                    data_size=reg_width),
+                                    data_size=reg_width,
+                                    logical_target_register=lreg(i, 8),
+                                    logical_source_registers=[lreg(i, 2)]),
                     StoreInstruction(id=dep_group_id + 9, target_mem=dep_group_id + 9,
-                                     source_registers=[dep_group_id + 8], data_size=reg_width, vlane_ctx=3)
+                                     source_registers=[dep_group_id + 8], data_size=reg_width, vlane_ctx=3,
+                                     logical_source_registers=[lreg(i, 8)])
                 ]
 
         sum_reduce_fake_dest = []
@@ -1207,7 +1335,9 @@ def create_softmax_instruction_stream(reg_width, has_exp2_unit, num_heads, seq_c
             per_head_insts += [
                 # Sum all exp values
                 ReduceInstruction(id=dep_group_id + 10, target_register=dep_group_id + 10, source_registers=[dep_group_id + 8],
-                                  data_size=reg_width),
+                                  data_size=reg_width,
+                                  logical_target_register=lreg(i, 10),
+                                  logical_source_registers=[lreg(i, 8)]),
             ]
             sum_reduce_fake_dest.append(dep_group_id + 10)
         
@@ -1215,14 +1345,18 @@ def create_softmax_instruction_stream(reg_width, has_exp2_unit, num_heads, seq_c
             dep_group_id = head_id + i*100
             per_head_insts += [
                 LoadInstruction(id=dep_group_id + 11, target_register=dep_group_id + 11,
-                                dependencies=[dep_group_id + 9], data_size=reg_width, vlane_ctx=3),
+                                dependencies=[dep_group_id + 9], data_size=reg_width, vlane_ctx=3,
+                                logical_target_register=lreg(i, 11)),
                 # Divide by sum (exp / sum)
                 FMAInstruction(id=dep_group_id + 12, target_register=dep_group_id + 12,
                                source_registers=[dep_group_id + 11] + sum_reduce_fake_dest,
-                               data_size=reg_width),
+                               data_size=reg_width,
+                               logical_target_register=lreg(i, 12),
+                               logical_source_registers=[lreg(i, 11)] + [lreg(j, 10) for j in range(explicit_split_count)]),
                 # Store result
                 StoreInstruction(id=dep_group_id + 13, source_registers=[dep_group_id + 12],
-                                 data_size=reg_width, vlane_ctx=1)
+                                 data_size=reg_width, vlane_ctx=1,
+                                 logical_source_registers=[lreg(i, 12)])
             ]
 
         # Assign context (register group) for this head
@@ -1250,20 +1384,31 @@ def create_rmsnorm_instruction_stream(reg_width, num_rows, num_contexts=1, lane_
         base = row * 100
         row_insts = [
             LoadInstruction(id=base + 0, target_register=base + 0,
-                            data_size=data_size, vlane_ctx=0),
+                            data_size=data_size, vlane_ctx=0,
+                            logical_target_register=0),
             FMAInstruction(id=base + 1, target_register=base + 1,
-                           source_registers=[base + 0], data_size=data_size),
+                           source_registers=[base + 0], data_size=data_size,
+                           logical_target_register=1,
+                           logical_source_registers=[0]),
             ReduceInstruction(id=base + 2, target_register=base + 2,
-                              source_registers=[base + 1], data_size=data_size),
+                              source_registers=[base + 1], data_size=data_size,
+                              logical_target_register=2,
+                              logical_source_registers=[1]),
             FMAInstruction(id=base + 3, target_register=base + 3,
                            source_registers=[base + 0, base + 2],
-                           dependencies=[base + 0, base + 2], data_size=data_size),
+                           dependencies=[base + 0, base + 2], data_size=data_size,
+                           logical_target_register=3,
+                           logical_source_registers=[0, 2]),
             LoadInstruction(id=base + 4, target_register=base + 4,
-                            dependencies=[base + 3], data_size=data_size, vlane_ctx=2),
+                            dependencies=[base + 3], data_size=data_size, vlane_ctx=2,
+                            logical_target_register=4),
             FMAInstruction(id=base + 5, target_register=base + 5,
-                           source_registers=[base + 3, base + 4], data_size=data_size),
+                           source_registers=[base + 3, base + 4], data_size=data_size,
+                           logical_target_register=5,
+                           logical_source_registers=[3, 4]),
             StoreInstruction(id=base + 6, source_registers=[base + 5],
-                             data_size=data_size, vlane_ctx=1),
+                             data_size=data_size, vlane_ctx=1,
+                             logical_source_registers=[5]),
         ]
 
         ctx = row % num_contexts
@@ -1284,41 +1429,68 @@ def create_silu_instruction_stream(reg_width, has_exp2_unit, num_rows,
         base = row * 100
         row_insts = [
             LoadInstruction(id=base + 0, target_register=base + 0,
-                            data_size=data_size, vlane_ctx=0),
+                            data_size=data_size, vlane_ctx=0,
+                            logical_target_register=0),
             FMAInstruction(id=base + 1, target_register=base + 1,
-                           source_registers=[base + 0], data_size=data_size),
+                           source_registers=[base + 0], data_size=data_size,
+                           logical_target_register=1,
+                           logical_source_registers=[0]),
         ]
         if has_exp2_unit:
             row_insts += [
                 EXP2Instruction(id=base + 2, target_register=base + 2,
-                                source_registers=[base + 1], data_size=data_size),
+                                source_registers=[base + 1], data_size=data_size,
+                                logical_target_register=2,
+                                logical_source_registers=[1]),
                 FMAInstruction(id=base + 3, target_register=base + 3,
-                               source_registers=[base + 2], data_size=data_size),
+                               source_registers=[base + 2], data_size=data_size,
+                               logical_target_register=3,
+                               logical_source_registers=[2]),
                 FMAInstruction(id=base + 4, target_register=base + 4,
-                               source_registers=[base + 3], data_size=data_size),
+                               source_registers=[base + 3], data_size=data_size,
+                               logical_target_register=4,
+                               logical_source_registers=[3]),
                 StoreInstruction(id=base + 5, source_registers=[base + 4],
-                                 data_size=data_size, vlane_ctx=1),
+                                 data_size=data_size, vlane_ctx=1,
+                                 logical_source_registers=[4]),
             ]
         else:
             row_insts += [
                 FMAInstruction(id=base + 2, target_register=base + 2,
-                               source_registers=[base + 1], data_size=data_size),
+                               source_registers=[base + 1], data_size=data_size,
+                               logical_target_register=2,
+                               logical_source_registers=[1]),
                 FMAInstruction(id=base + 3, target_register=base + 3,
-                               source_registers=[base + 2], data_size=data_size),
+                               source_registers=[base + 2], data_size=data_size,
+                               logical_target_register=3,
+                               logical_source_registers=[2]),
                 FMAInstruction(id=base + 4, target_register=base + 4,
-                               source_registers=[base + 3], data_size=data_size),
+                               source_registers=[base + 3], data_size=data_size,
+                               logical_target_register=4,
+                               logical_source_registers=[3]),
                 FMAInstruction(id=base + 5, target_register=base + 5,
-                               source_registers=[base + 4], data_size=data_size),
+                               source_registers=[base + 4], data_size=data_size,
+                               logical_target_register=5,
+                               logical_source_registers=[4]),
                 FMAInstruction(id=base + 6, target_register=base + 6,
-                               source_registers=[base + 5], data_size=data_size),
+                               source_registers=[base + 5], data_size=data_size,
+                               logical_target_register=6,
+                               logical_source_registers=[5]),
                 FMAInstruction(id=base + 7, target_register=base + 7,
-                               source_registers=[base + 6], data_size=data_size),
+                               source_registers=[base + 6], data_size=data_size,
+                               logical_target_register=7,
+                               logical_source_registers=[6]),
                 FMAInstruction(id=base + 8, target_register=base + 8,
-                               source_registers=[base + 7], data_size=data_size),
+                               source_registers=[base + 7], data_size=data_size,
+                               logical_target_register=8,
+                               logical_source_registers=[7]),
                 FMAInstruction(id=base + 9, target_register=base + 9,
-                               source_registers=[base + 8], data_size=data_size),
+                               source_registers=[base + 8], data_size=data_size,
+                               logical_target_register=9,
+                               logical_source_registers=[8]),
                 StoreInstruction(id=base + 10, source_registers=[base + 9],
-                                 data_size=data_size, vlane_ctx=1),
+                                 data_size=data_size, vlane_ctx=1,
+                                 logical_source_registers=[9]),
             ]
 
         ctx = row % num_contexts
@@ -1342,18 +1514,27 @@ def create_rope_instruction_stream(reg_width, num_rows, num_contexts=1, lane_str
         base = row * 100
         row_insts = [
             LoadInstruction(id=base + 0, target_register=base + 0,
-                            data_size=data_size, vlane_ctx=2),
+                            data_size=data_size, vlane_ctx=2,
+                            logical_target_register=0),
             FMAInstruction(id=base + 1, target_register=base + 1,
-                           source_registers=[base + 0], data_size=data_size),
+                           source_registers=[base + 0], data_size=data_size,
+                           logical_target_register=1,
+                           logical_source_registers=[0]),
             LoadInstruction(id=base + 2, target_register=base + 2,
-                            dependencies=[base + 1], data_size=data_size, vlane_ctx=0),
+                            dependencies=[base + 1], data_size=data_size, vlane_ctx=0,
+                            logical_target_register=2),
             FMAInstruction(id=base + 3, target_register=base + 3,
-                           source_registers=[base + 1, base + 2], data_size=data_size),
+                           source_registers=[base + 1, base + 2], data_size=data_size,
+                           logical_target_register=3,
+                           logical_source_registers=[1, 2]),
             FMAInstruction(id=base + 4, target_register=base + 4,
                            source_registers=[base + 1, base + 2, base + 3],
-                           dependencies=[base + 1, base + 2, base + 3], data_size=data_size),
+                           dependencies=[base + 1, base + 2, base + 3], data_size=data_size,
+                           logical_target_register=4,
+                           logical_source_registers=[1, 2, 3]),
             StoreInstruction(id=base + 5, source_registers=[base + 3, base + 4],
-                             data_size=data_size, vlane_ctx=1),
+                             data_size=data_size, vlane_ctx=1,
+                             logical_source_registers=[3, 4]),
         ]
 
         ctx = row % num_contexts
@@ -1421,7 +1602,9 @@ def run_kernel_simulation(args, kernel=None, num_contexts=None, issue_width=None
         chaining_enabled=args.chaining,
         chaining_granularity=64,
         execution_mode=execution_mode,
-        ooo_window_size=args.ooo_window_size,
+        issue_queue_window=args.issue_queue_window,
+        ooo_scheduler_window_size=args.ooo_scheduler_window_size,
+        register_renaming=args.register_renaming,
         issue_width=selected_issue_width,
         num_contexts=selected_contexts,
         lane_strides=lane_strides,
@@ -1468,6 +1651,12 @@ BENCHMARK_ALIASES = {
     'seq-chunk-bits': 'seq_chunk_bits',
     'register-width': 'register_width',
     'cache-bandwidth': 'cache_bandwidth',
+    'ooo_window_size': 'ooo_scheduler_window_size',
+    'ooo-window-size': 'ooo_scheduler_window_size',
+    'scheduler-window-size': 'ooo_scheduler_window_size',
+    'scheduler_window_size': 'ooo_scheduler_window_size',
+    'issue-queue-window': 'issue_queue_window',
+    'register-renaming': 'register_renaming',
 }
 
 BENCHMARK_INT_FIELDS = {
@@ -1480,7 +1669,8 @@ BENCHMARK_INT_FIELDS = {
     'simple_elementwise_width',
     'complex_elementwise_width',
     'cache_bandwidth',
-    'ooo_window_size',
+    'issue_queue_window',
+    'ooo_scheduler_window_size',
     'issue_width',
     'num_contexts',
     'lane_stride_0',
@@ -1490,7 +1680,7 @@ BENCHMARK_INT_FIELDS = {
     'max_cycles',
 }
 
-BENCHMARK_BOOL_FIELDS = {'exp2_unit', 'chaining', 'quiet'}
+BENCHMARK_BOOL_FIELDS = {'exp2_unit', 'chaining', 'quiet', 'register_renaming'}
 BENCHMARK_METADATA_KEYS = {
     'metadata',
     'description',
@@ -1651,6 +1841,12 @@ def _load_yaml_benchmark_cases(path: str) -> Tuple[List[Dict], Dict]:
         raise ValueError("YAML benchmark config must be a list or mapping")
 
     defaults = data.get('defaults', {})
+    hardware_configs = data.get('hardware_configs') or data.get('hardware') or [{}]
+    if isinstance(hardware_configs, dict):
+        hardware_configs = [hardware_configs]
+    if not isinstance(hardware_configs, list):
+        raise ValueError("YAML hardware_configs must be a mapping or list of mappings")
+
     raw_cases = (
         data.get('cases') or
         data.get('benchmarks') or
@@ -1658,9 +1854,38 @@ def _load_yaml_benchmark_cases(path: str) -> Tuple[List[Dict], Dict]:
         []
     )
     if not raw_cases:
-        raw_cases = [{key: value for key, value in data.items() if key != 'defaults'}]
+        raw_cases = [
+            {key: value for key, value in data.items()
+             if key not in {'defaults', 'hardware_configs', 'hardware'}}
+        ]
 
-    return raw_cases, defaults
+    combined_cases = []
+    for hardware in hardware_configs:
+        if hardware is None:
+            hardware = {}
+        if not isinstance(hardware, dict):
+            raise ValueError(f"Hardware config must be a mapping, got {type(hardware).__name__}")
+        hardware_name = hardware.get('name')
+        hardware_fields = {key: value for key, value in hardware.items() if key != 'name'}
+        for raw_case in raw_cases:
+            if raw_case is None:
+                continue
+            if not isinstance(raw_case, dict):
+                raise ValueError(f"Benchmark case must be a mapping, got {type(raw_case).__name__}")
+            merged = hardware_fields.copy()
+            merged.update(raw_case)
+            if hardware_name is not None:
+                metadata = merged.get('metadata', {})
+                if not isinstance(metadata, dict):
+                    metadata = {}
+                metadata = metadata.copy()
+                metadata.setdefault('hardware_config', hardware_name)
+                merged['metadata'] = metadata
+                if merged.get('name'):
+                    merged['name'] = f"{hardware_name}/{merged['name']}"
+            combined_cases.append(merged)
+
+    return combined_cases, defaults
 
 
 def _load_csv_benchmark_cases(path: str) -> Tuple[List[Dict], Dict]:
@@ -1688,7 +1913,7 @@ def load_benchmark_cases(path: str) -> List[Dict]:
     normalized_defaults = {}
     for key, value in defaults.items():
         normalized_key = _normalize_benchmark_key(str(key))
-        normalized_defaults[normalized_key] = _coerce_benchmark_value(normalized_key, value)
+        normalized_defaults[normalized_key] = value
 
     for raw_case in raw_cases:
         if raw_case is None:
@@ -1758,7 +1983,9 @@ def _run_benchmark_case(args, case: Dict) -> Dict:
         'complex_elementwise_width': case_args.complex_elementwise_width,
         'all_compute_widths': case_args.all_compute_widths,
         'chaining': case_args.chaining,
-        'ooo_window_size': case_args.ooo_window_size,
+        'register_renaming': case_args.register_renaming,
+        'issue_queue_window': case_args.issue_queue_window,
+        'ooo_scheduler_window_size': case_args.ooo_scheduler_window_size,
         'lane_strides': (
             case_args.lane_stride_0,
             case_args.lane_stride_1,
@@ -1785,26 +2012,51 @@ def _benchmark_mode_compare_key(row: Dict) -> Tuple:
         row['complex_elementwise_width'],
         row['all_compute_widths'],
         row['chaining'],
-        row['ooo_window_size'],
+        row['register_renaming'],
+        row['issue_queue_window'],
+        row['ooo_scheduler_window_size'],
+        row['lane_strides'],
+    )
+
+
+def _benchmark_baseline_key(row: Dict) -> Tuple:
+    return (
+        row['name'],
+        row['kernel'],
+        row['exp2_unit'],
+        row['num_heads'],
+        row['num_rows'],
+        row['seq_chunk_bits'],
+        row['register_width'],
+        row['cache_bandwidth'],
+        row['reduce_compute_width'],
+        row['simple_elementwise_width'],
+        row['complex_elementwise_width'],
+        row['all_compute_widths'],
+        row['chaining'],
+        row['register_renaming'],
+        row['issue_queue_window'],
+        row['ooo_scheduler_window_size'],
         row['lane_strides'],
     )
 
 
 def _annotate_speedups(rows: List[Dict]):
-    baseline_by_kernel = {}
+    baseline_by_config = {}
     in_order_cycles_by_config = {}
 
     for row in rows:
-        if row['lanes'] == 1 and row['issue_width'] == 2:
-            baseline_by_kernel.setdefault((row['kernel'], row['execution_mode']), row['cycles'])
+        if (row['execution_mode'] == 'in-order' and
+                row['lanes'] == 1 and row['issue_width'] == 1):
+            baseline_by_config.setdefault(_benchmark_baseline_key(row), row['cycles'])
         if row['execution_mode'] == 'in-order':
             in_order_cycles_by_config.setdefault(_benchmark_mode_compare_key(row), row['cycles'])
 
     for row in rows:
-        baseline_by_kernel.setdefault((row['kernel'], row['execution_mode']), row['cycles'])
+        baseline_by_config.setdefault(_benchmark_baseline_key(row), row['cycles'])
 
     for row in rows:
-        baseline_cycles = baseline_by_kernel[(row['kernel'], row['execution_mode'])]
+        baseline_cycles = baseline_by_config[_benchmark_baseline_key(row)]
         row['speedup'] = baseline_cycles / row['cycles'] if row['cycles'] else 0.0
         in_order_cycles = in_order_cycles_by_config.get(_benchmark_mode_compare_key(row))
         row['ooo_speedup'] = in_order_cycles / row['cycles'] if in_order_cycles and row['cycles'] else None
@@ -1820,6 +2072,16 @@ def _format_benchmark_values(rows: List[Dict], key: str) -> str:
     return ", ".join(str(value) for value in values)
 
 
+def _resolve_benchmark_workers(args, case_count: int) -> int:
+    """Resolve benchmark worker count; 0 or less means auto parallelism."""
+    if case_count < 1:
+        return 1
+    requested_workers = args.benchmark_workers
+    if requested_workers is None or requested_workers <= 0:
+        return max(1, min(case_count, os.cpu_count() or 1))
+    return max(1, min(requested_workers, case_count))
+
+
 def run_benchmark_suite(args) -> str:
     """Run a compact multi-kernel, multi-lane benchmark and return Markdown."""
     if args.benchmark_config:
@@ -1832,7 +2094,13 @@ def run_benchmark_suite(args) -> str:
     if not cases:
         raise ValueError("No benchmark cases to run")
 
-    rows = [_run_benchmark_case(args, case) for case in cases]
+    benchmark_workers = _resolve_benchmark_workers(args, len(cases))
+    if benchmark_workers > 1:
+        with concurrent.futures.ProcessPoolExecutor(max_workers=benchmark_workers) as executor:
+            futures = [executor.submit(_run_benchmark_case, args, case) for case in cases]
+            rows = [future.result() for future in futures]
+    else:
+        rows = [_run_benchmark_case(args, case) for case in cases]
     _annotate_speedups(rows)
     has_case_names = any(row['name'] for row in rows)
     has_case_descriptions = any(row['description'] for row in rows)
@@ -1849,8 +2117,11 @@ def run_benchmark_suite(args) -> str:
         "## Configuration",
         "",
         f"- benchmark source: `{source}`",
+        f"- benchmark workers: `{benchmark_workers}`",
         f"- execution modes: `{_format_benchmark_values(rows, 'execution_mode')}`",
-        f"- out-of-order window sizes: `{_format_benchmark_values(rows, 'ooo_window_size')}` uops",
+        f"- register renaming: `{_format_benchmark_values(rows, 'register_renaming')}`",
+        f"- issue queue windows: `{_format_benchmark_values(rows, 'issue_queue_window')}` not-yet-completed uops",
+        f"- out-of-order scheduler window sizes: `{_format_benchmark_values(rows, 'ooo_scheduler_window_size')}` not-yet-issued uops",
         f"- register widths: `{_format_benchmark_values(rows, 'register_width')}` bits",
         f"- sequence chunks: `{_format_benchmark_values(rows, 'seq_chunk_bits')}` bits",
         f"- rows per non-softmax kernel: `{_format_benchmark_values(rows, 'num_rows')}`",
@@ -1859,8 +2130,8 @@ def run_benchmark_suite(args) -> str:
         f"- all compute widths: `{_format_benchmark_values(rows, 'all_compute_widths')}` bits",
         f"- exp2 unit values: `{_format_benchmark_values(rows, 'exp2_unit')}`",
         "",
-        "Speedup is normalized per kernel and execution mode to `lanes=1, issue_width=2` when present; otherwise the first case for that kernel/mode is used.",
-        "`ooo vs in-order` compares each row against the matching in-order case with the same case/kernel/lanes/issue_width/workload/hardware settings.",
+        "`baseline speedup` is normalized per kernel to the matching in-order `lanes=1, issue_width=1` case when present; otherwise the first case for that kernel is used.",
+        "`ooo speedup` compares each row against the matching in-order case with the same case/kernel/lanes/issue_width/workload/hardware settings.",
         "",
         "## Summary",
         "",
@@ -1868,24 +2139,25 @@ def run_benchmark_suite(args) -> str:
 
     if has_case_names and has_case_descriptions:
         lines.extend([
-            "| case | description | kernel | mode | lanes | issue width | cycles | speedup | ooo vs in-order | issue util | load | store | fma | reduce | exp2 |",
-            "|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+            "| case | description | kernel | mode | rename | lanes | issue width | cycles | baseline speedup | ooo speedup | issue util | load | store | fma | reduce | exp2 |",
+            "|---|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
         ])
     elif has_case_names:
         lines.extend([
-            "| case | kernel | mode | lanes | issue width | cycles | speedup | ooo vs in-order | issue util | load | store | fma | reduce | exp2 |",
-            "|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+            "| case | kernel | mode | rename | lanes | issue width | cycles | baseline speedup | ooo speedup | issue util | load | store | fma | reduce | exp2 |",
+            "|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
         ])
     else:
         lines.extend([
-            "| kernel | mode | lanes | issue width | cycles | speedup | ooo vs in-order | issue util | load | store | fma | reduce | exp2 |",
-            "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+            "| kernel | mode | rename | lanes | issue width | cycles | baseline speedup | ooo speedup | issue util | load | store | fma | reduce | exp2 |",
+            "|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
         ])
 
     for row in rows:
         row_cells = [
             _md_cell(row['kernel']),
             _md_cell(row['execution_mode']),
+            str(row['register_renaming']),
             str(row['lanes']),
             str(row['issue_width']),
             str(row['cycles']),
@@ -1914,24 +2186,25 @@ def run_benchmark_suite(args) -> str:
     if has_case_names:
         if has_case_descriptions:
             lines.extend([
-                "| case | description | kernel | mode | lanes | issue width | instructions | micro-ops |",
-                "|---|---|---|---|---:|---:|---:|---:|",
+                "| case | description | kernel | mode | rename | lanes | issue width | instructions | micro-ops |",
+                "|---|---|---|---|---|---:|---:|---:|---:|",
             ])
         else:
             lines.extend([
-                "| case | kernel | mode | lanes | issue width | instructions | micro-ops |",
-                "|---|---|---|---:|---:|---:|---:|",
+                "| case | kernel | mode | rename | lanes | issue width | instructions | micro-ops |",
+                "|---|---|---|---|---:|---:|---:|---:|",
             ])
     else:
         lines.extend([
-            "| kernel | mode | lanes | issue width | instructions | micro-ops |",
-            "|---|---|---:|---:|---:|---:|",
+            "| kernel | mode | rename | lanes | issue width | instructions | micro-ops |",
+            "|---|---|---|---:|---:|---:|---:|",
         ])
 
     for row in rows:
         row_cells = [
             _md_cell(row['kernel']),
             _md_cell(row['execution_mode']),
+            str(row['register_renaming']),
             str(row['lanes']),
             str(row['issue_width']),
             str(row['instruction_count']),
@@ -2100,12 +2373,36 @@ def parse_arguments():
         default=True,
         help="Enable chaining"
     )
+
+    rename_group = parser.add_mutually_exclusive_group()
+    rename_group.add_argument(
+        "--register-renaming",
+        dest="register_renaming",
+        action="store_true",
+        default=True,
+        help="Enable physical register renaming for independent heads or rows"
+    )
+    rename_group.add_argument(
+        "--no-register-renaming",
+        dest="register_renaming",
+        action="store_false",
+        help="Disable register renaming and serialize repeated logical registers within each context"
+    )
     
     parser.add_argument(
+        "--issue-queue-window",
+        type=int,
+        default=10,
+        help="Oldest not-yet-completed uops visible to the issue queue"
+    )
+
+    parser.add_argument(
+        "--ooo-scheduler-window-size",
         "--ooo-window-size",
+        dest="ooo_scheduler_window_size",
         type=int,
         default=128,
-        help="Out-of-order execution window size"
+        help="Not-yet-issued uops visible to the out-of-order scheduler inside the issue queue window"
     )
 
     parser.add_argument(
@@ -2176,6 +2473,13 @@ def parse_arguments():
     )
 
     parser.add_argument(
+        "--benchmark-workers",
+        type=int,
+        default=0,
+        help="Worker processes for benchmark cases; 0 means auto (min(case count, CPU count))"
+    )
+
+    parser.add_argument(
         "--quiet",
         action="store_true",
         help="Print a compact summary without timelines or per-uop details"
@@ -2224,6 +2528,9 @@ def main():
         print(f"  Complex elementwise compute unit width: {complex_width} bits")
         print(f"  Cache bandwidth: {args.cache_bandwidth} bytes/cycle")
         print(f"  Execution mode: {execution_mode.value}")
+        print(f"  Register renaming: {'enabled' if args.register_renaming else 'disabled'}")
+        print(f"  Issue queue window: {args.issue_queue_window} uops")
+        print(f"  OOO scheduler window: {args.ooo_scheduler_window_size} uops")
         print(f"  Chaining: {'enabled' if args.chaining else 'disabled'}")
         print(f"  num_contexts: {args.num_contexts}")
         print(f"  lane strides: ({args.lane_stride_0}, {args.lane_stride_1}, {args.lane_stride_2}, {args.lane_stride_3})")

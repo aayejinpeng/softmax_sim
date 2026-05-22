@@ -6,8 +6,10 @@
 #
 # Parameter meanings
 # - lanes -> num_contexts, i.e. how many independent lane contexts can run in parallel
-# - execution_mode -> in-order or out-of-order instruction scheduling
-# - ooo_window_size -> out-of-order scheduler lookahead window in uops; only affects out-of-order mode
+# - execution_mode -> in-order or out-of-order issue scheduling
+# - register_renaming -> true lets independent heads/rows reuse logical registers without false hazards
+# - issue_queue_window -> oldest not-yet-completed uops visible to both schedulers
+# - ooo_scheduler_window_size -> oldest not-yet-issued uops the out-of-order scheduler can choose from inside the issue queue window
 # - issue_width -> max uops issued per cycle across all active lanes
 # - lane_stride_0..3 -> vlane0..vlane3 byte strides; 0 means shared data
 # - num_heads -> independent softmax heads
@@ -50,14 +52,24 @@
 
 defaults:
   execution_mode: [in-order, out-of-order]
-  ooo_window_size: 2
-  register_width: 512
-  cache_bandwidth: 64  # bytes per cycle
-  all_compute_widths: 512
+  register_renaming: [false, true]
+  chaining: false
+  issue_queue_window: 16
+  ooo_scheduler_window_size: 8
   lane_stride_0: 256
   lane_stride_1: 256
   lane_stride_2: 0
   lane_stride_3: 256
+
+hardware_configs:
+  - name: vw512_bw64
+    register_width: 512
+    cache_bandwidth: 64  # bytes per cycle
+    all_compute_widths: 512
+  - name: vw1024_bw128
+    register_width: 1024
+    cache_bandwidth: 128
+    all_compute_widths: 512
 
 cases:
   - name: softmax_fma_exp_approx

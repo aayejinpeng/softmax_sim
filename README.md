@@ -58,7 +58,10 @@ usage: softmax_simulator.py [-h] [--execution-mode {in-order,out-of-order}]
                             [--simple-elementwise-width {128,256,512,1024}]
                             [--complex-elementwise-width {128,256,512,1024}]
                             [--cache-bandwidth {32,64,128}] [--chaining]
-                            [--ooo-window-size OOO_WINDOW_SIZE]
+                            [--register-renaming | --no-register-renaming]
+                            [--issue-queue-window ISSUE_QUEUE_WINDOW]
+                            [--ooo-scheduler-window-size OOO_SCHEDULER_WINDOW_SIZE]
+                            [--benchmark-workers BENCHMARK_WORKERS]
 
 RISC-V Vector Processor Softmax Simulator
 
@@ -77,8 +80,17 @@ options:
   --cache-bandwidth {32,64,128}
                         Cache bandwidth in bytes per cycle (default: 64)
   --chaining            Enable chaining (default: True)
-  --ooo-window-size OOO_WINDOW_SIZE
-                        Out-of-order execution window size (default: 128)
+  --register-renaming, --no-register-renaming
+                        Enable or disable physical register renaming (default: True)
+  --issue-queue-window ISSUE_QUEUE_WINDOW
+                        Oldest not-yet-completed uops visible to the issue
+                        queue (default: 10)
+  --ooo-scheduler-window-size OOO_SCHEDULER_WINDOW_SIZE
+                        Not-yet-issued uops visible to the out-of-order
+                        scheduler inside the issue queue window (default: 128)
+  --benchmark-workers BENCHMARK_WORKERS
+                        Worker processes for benchmark cases; 0 means auto
+                        (min(case count, CPU count)) (default: 0)
 ```
 
 ### Example Usage
@@ -87,8 +99,14 @@ options:
 # Run with default in-order configuration
 python softmax_simulator.py
 
-# Run out-of-order execution with larger window
-python softmax_simulator.py --execution-mode out-of-order --ooo-window-size 256
+# Run out-of-order issue with a larger scheduler window
+python softmax_simulator.py --execution-mode out-of-order --ooo-scheduler-window-size 256
+
+# Run a benchmark sweep with default auto-parallel workers
+python softmax_simulator.py --benchmark-config plans/benchmark_config.example.yaml
+
+# Force a fixed worker count, or use 1 for sequential execution
+python softmax_simulator.py --benchmark-config plans/benchmark_config.example.yaml --benchmark-workers 2
 
 ```
 
@@ -137,6 +155,13 @@ The simulator tracks both:
 - **Instruction-level dependencies**: Specified in the instruction stream
 - **μop-level dependencies**: Generated during instruction decomposition
 - **Resource constraints**: Compute unit availability and cache bandwidth
+- **Register renaming**: Optional serialization of repeated logical registers when disabled
+
+### Benchmark YAML
+Benchmark YAML may include:
+- `defaults`: shared sweep knobs
+- `hardware_configs`: one or more hardware profiles to cross with the cases
+- `cases`: workload sweeps and metadata
 
 ### Chaining Implementation
 When chaining is enabled:
