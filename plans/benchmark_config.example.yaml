@@ -6,6 +6,8 @@
 #
 # Parameter meanings
 # - lanes -> num_contexts, i.e. how many independent lane contexts can run in parallel
+# - execution_mode -> in-order or out-of-order instruction scheduling
+# - ooo_window_size -> out-of-order scheduler lookahead window in uops; only affects out-of-order mode
 # - issue_width -> max uops issued per cycle across all active lanes
 # - lane_stride_0..3 -> vlane0..vlane3 byte strides; 0 means shared data
 # - num_heads -> independent softmax heads
@@ -47,8 +49,9 @@
 # plans/benchmark_instruction_table.example.csv
 
 defaults:
-  execution_mode: in-order
-  register_width: 2048
+  execution_mode: [in-order, out-of-order]
+  ooo_window_size: 2
+  register_width: 512
   cache_bandwidth: 64  # bytes per cycle
   all_compute_widths: 512
   lane_stride_0: 256

@@ -1621,6 +1621,7 @@ def _default_benchmark_cases() -> List[Dict]:
     for kernel in ["softmax", "rmsnorm", "silu", "rope"]:
         raw_cases.append({
             'kernel': kernel,
+            'execution_mode': ['in-order', 'out-of-order'],
             'num_contexts': [1, 2, 4],
             'issue_width': [1, 2],
         })
@@ -1731,11 +1732,14 @@ def _run_benchmark_case(args, case: Dict) -> Dict:
         'dependency_chain': str(dependency_chain),
         'latency_diagram': str(latency_diagram),
         'parameter_notes': parameter_notes,
+        'execution_mode': case_args.execution_mode,
         'kernel': case_args.kernel,
+        'exp2_unit': case_args.exp2_unit,
         'lanes': case_args.num_contexts,
         'issue_width': case_args.issue_width,
         'cycles': results['total_cycles'],
         'speedup': 1.0,
+        'ooo_speedup': None,
         'issue_util': metrics['issue_slot_utilization'],
         'load_util': metrics['unit_active_pct']['load'],
         'store_util': metrics['unit_active_pct']['store'],
@@ -1744,22 +1748,76 @@ def _run_benchmark_case(args, case: Dict) -> Dict:
         'exp2_util': metrics['unit_active_pct']['exp2'],
         'instruction_count': len(instructions),
         'uop_count': len(processor.uops),
+        'num_heads': case_args.num_heads,
+        'num_rows': case_args.num_rows,
+        'seq_chunk_bits': case_args.seq_chunk_bits,
+        'register_width': case_args.register_width,
+        'cache_bandwidth': case_args.cache_bandwidth,
+        'reduce_compute_width': case_args.reduce_compute_width,
+        'simple_elementwise_width': case_args.simple_elementwise_width,
+        'complex_elementwise_width': case_args.complex_elementwise_width,
+        'all_compute_widths': case_args.all_compute_widths,
+        'chaining': case_args.chaining,
+        'ooo_window_size': case_args.ooo_window_size,
+        'lane_strides': (
+            case_args.lane_stride_0,
+            case_args.lane_stride_1,
+            case_args.lane_stride_2,
+            case_args.lane_stride_3,
+        ),
     }
+
+
+def _benchmark_mode_compare_key(row: Dict) -> Tuple:
+    return (
+        row['name'],
+        row['kernel'],
+        row['exp2_unit'],
+        row['lanes'],
+        row['issue_width'],
+        row['num_heads'],
+        row['num_rows'],
+        row['seq_chunk_bits'],
+        row['register_width'],
+        row['cache_bandwidth'],
+        row['reduce_compute_width'],
+        row['simple_elementwise_width'],
+        row['complex_elementwise_width'],
+        row['all_compute_widths'],
+        row['chaining'],
+        row['ooo_window_size'],
+        row['lane_strides'],
+    )
 
 
 def _annotate_speedups(rows: List[Dict]):
     baseline_by_kernel = {}
+    in_order_cycles_by_config = {}
 
     for row in rows:
         if row['lanes'] == 1 and row['issue_width'] == 2:
-            baseline_by_kernel.setdefault(row['kernel'], row['cycles'])
+            baseline_by_kernel.setdefault((row['kernel'], row['execution_mode']), row['cycles'])
+        if row['execution_mode'] == 'in-order':
+            in_order_cycles_by_config.setdefault(_benchmark_mode_compare_key(row), row['cycles'])
 
     for row in rows:
-        baseline_by_kernel.setdefault(row['kernel'], row['cycles'])
+        baseline_by_kernel.setdefault((row['kernel'], row['execution_mode']), row['cycles'])
 
     for row in rows:
-        baseline_cycles = baseline_by_kernel[row['kernel']]
+        baseline_cycles = baseline_by_kernel[(row['kernel'], row['execution_mode'])]
         row['speedup'] = baseline_cycles / row['cycles'] if row['cycles'] else 0.0
+        in_order_cycles = in_order_cycles_by_config.get(_benchmark_mode_compare_key(row))
+        row['ooo_speedup'] = in_order_cycles / row['cycles'] if in_order_cycles and row['cycles'] else None
+
+
+def _format_benchmark_values(rows: List[Dict], key: str) -> str:
+    """Format the concrete values used by expanded benchmark cases."""
+    values = []
+    for row in rows:
+        value = row[key]
+        if value not in values:
+            values.append(value)
+    return ", ".join(str(value) for value in values)
 
 
 def run_benchmark_suite(args) -> str:
@@ -1791,17 +1849,18 @@ def run_benchmark_suite(args) -> str:
         "## Configuration",
         "",
         f"- benchmark source: `{source}`",
-        f"- execution mode: `{args.execution_mode}`",
-        f"- register width: `{args.register_width}` bits",
-        f"- sequence chunk: `{args.seq_chunk_bits}` bits",
-        f"- rows per non-softmax kernel: `{args.num_rows}`",
-        f"- softmax heads: `{args.num_heads}`",
-        f"- cache bandwidth: `{args.cache_bandwidth}` bytes/cycle",
-        f"- compute widths: reduce/simple/complex = `{args.reduce_compute_width}`/`{args.simple_elementwise_width}`/`{args.complex_elementwise_width}` bits",
-        f"- lane strides: `{args.lane_stride_0}, {args.lane_stride_1}, {args.lane_stride_2}, {args.lane_stride_3}` bytes",
-        f"- exp2 unit for softmax: `{args.exp2_unit}`",
+        f"- execution modes: `{_format_benchmark_values(rows, 'execution_mode')}`",
+        f"- out-of-order window sizes: `{_format_benchmark_values(rows, 'ooo_window_size')}` uops",
+        f"- register widths: `{_format_benchmark_values(rows, 'register_width')}` bits",
+        f"- sequence chunks: `{_format_benchmark_values(rows, 'seq_chunk_bits')}` bits",
+        f"- rows per non-softmax kernel: `{_format_benchmark_values(rows, 'num_rows')}`",
+        f"- softmax heads: `{_format_benchmark_values(rows, 'num_heads')}`",
+        f"- cache bandwidths: `{_format_benchmark_values(rows, 'cache_bandwidth')}` bytes/cycle",
+        f"- all compute widths: `{_format_benchmark_values(rows, 'all_compute_widths')}` bits",
+        f"- exp2 unit values: `{_format_benchmark_values(rows, 'exp2_unit')}`",
         "",
-        "Speedup is normalized per kernel to `lanes=1, issue_width=2` when present; otherwise the first case for that kernel is used.",
+        "Speedup is normalized per kernel and execution mode to `lanes=1, issue_width=2` when present; otherwise the first case for that kernel/mode is used.",
+        "`ooo vs in-order` compares each row against the matching in-order case with the same case/kernel/lanes/issue_width/workload/hardware settings.",
         "",
         "## Summary",
         "",
@@ -1809,27 +1868,29 @@ def run_benchmark_suite(args) -> str:
 
     if has_case_names and has_case_descriptions:
         lines.extend([
-            "| case | description | kernel | lanes | issue width | cycles | speedup | issue util | load | store | fma | reduce | exp2 |",
-            "|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+            "| case | description | kernel | mode | lanes | issue width | cycles | speedup | ooo vs in-order | issue util | load | store | fma | reduce | exp2 |",
+            "|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
         ])
     elif has_case_names:
         lines.extend([
-            "| case | kernel | lanes | issue width | cycles | speedup | issue util | load | store | fma | reduce | exp2 |",
-            "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+            "| case | kernel | mode | lanes | issue width | cycles | speedup | ooo vs in-order | issue util | load | store | fma | reduce | exp2 |",
+            "|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
         ])
     else:
         lines.extend([
-            "| kernel | lanes | issue width | cycles | speedup | issue util | load | store | fma | reduce | exp2 |",
-            "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+            "| kernel | mode | lanes | issue width | cycles | speedup | ooo vs in-order | issue util | load | store | fma | reduce | exp2 |",
+            "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
         ])
 
     for row in rows:
         row_cells = [
             _md_cell(row['kernel']),
+            _md_cell(row['execution_mode']),
             str(row['lanes']),
             str(row['issue_width']),
             str(row['cycles']),
             f"{row['speedup']:.2f}x",
+            f"{row['ooo_speedup']:.2f}x" if row['ooo_speedup'] is not None else "-",
             f"{row['issue_util']:.1f}%",
             f"{row['load_util']:.1f}%",
             f"{row['store_util']:.1f}%",
@@ -1853,23 +1914,24 @@ def run_benchmark_suite(args) -> str:
     if has_case_names:
         if has_case_descriptions:
             lines.extend([
-                "| case | description | kernel | lanes | issue width | instructions | micro-ops |",
-                "|---|---|---|---:|---:|---:|---:|",
+                "| case | description | kernel | mode | lanes | issue width | instructions | micro-ops |",
+                "|---|---|---|---|---:|---:|---:|---:|",
             ])
         else:
             lines.extend([
-                "| case | kernel | lanes | issue width | instructions | micro-ops |",
-                "|---|---|---:|---:|---:|---:|",
+                "| case | kernel | mode | lanes | issue width | instructions | micro-ops |",
+                "|---|---|---|---:|---:|---:|---:|",
             ])
     else:
         lines.extend([
-            "| kernel | lanes | issue width | instructions | micro-ops |",
-            "|---|---:|---:|---:|---:|",
+            "| kernel | mode | lanes | issue width | instructions | micro-ops |",
+            "|---|---|---:|---:|---:|---:|",
         ])
 
     for row in rows:
         row_cells = [
             _md_cell(row['kernel']),
+            _md_cell(row['execution_mode']),
             str(row['lanes']),
             str(row['issue_width']),
             str(row['instruction_count']),
