@@ -53,13 +53,23 @@
 defaults:
   chaining: true
 
+baseline: 
+  execution_mode: in-order
+  register_width: 512
+  cache_bandwidth: 64  # bytes per cycle
+  all_compute_widths: 512
+  lanes: 1
+  issue_width: 1
+
+
 hardware_configs:
   - name: vw512_bw64_inorder
     execution_mode: in-order
     register_width: 512
     cache_bandwidth: 64  # bytes per cycle
     all_compute_widths: 512
-    baseline: true
+    lanes: [1, 2]
+    issue_width: [1, 2]
   - name: vw512_bw64_ooo_norename_8iq_8sch
     execution_mode: out-of-order
     register_renaming: false
@@ -68,6 +78,8 @@ hardware_configs:
     register_width: 512
     cache_bandwidth: 64  # bytes per cycle
     all_compute_widths: 512
+    lanes: [1, 2]
+    issue_width: [1, 2]
   - name: vw512_bw64_ooo_norename_16iq_16sch
     execution_mode: out-of-order
     register_renaming: false
@@ -76,6 +88,8 @@ hardware_configs:
     register_width: 512
     cache_bandwidth: 64  # bytes per cycle
     all_compute_widths: 512
+    lanes: [1, 2]
+    issue_width: [1, 2]
   - name: vw512_bw64_ooo_norename_32iq_32sch
     execution_mode: out-of-order
     register_renaming: false
@@ -84,6 +98,8 @@ hardware_configs:
     register_width: 512
     cache_bandwidth: 64  # bytes per cycle
     all_compute_widths: 512
+    lanes: [1, 2]
+    issue_width: [1, 2]
   - name: vw512_bw64_ooo_rename_32iq_32sch
     execution_mode: out-of-order
     register_renaming: true
@@ -92,6 +108,8 @@ hardware_configs:
     register_width: 512
     cache_bandwidth: 64  # bytes per cycle
     all_compute_widths: 512
+    lanes: [1, 2]
+    issue_width: [1, 2]
   - name: vw512_bw64_ooo_rename_64iq_64sch
     execution_mode: out-of-order
     register_renaming: true
@@ -100,6 +118,8 @@ hardware_configs:
     register_width: 512
     cache_bandwidth: 64  # bytes per cycle
     all_compute_widths: 512
+    lanes: [1, 2]
+    issue_width: [1, 2]
 
 cases:
   - name: softmax_fma_exp_approx
@@ -107,8 +127,6 @@ cases:
     exp2_unit: false
     num_heads: 128
     seq_chunk_bits: 2048
-    lanes: [1, 2]
-    issue_width: [1, 2]
     metadata:
       description: Softmax using a six-FMA polynomial approximation for exp2 when no dedicated EXP2 unit is available.
       lane_mapping: lanes becomes num_contexts; each lane is one independently runnable head context.
@@ -149,8 +167,6 @@ cases:
     exp2_unit: true
     num_heads: 128
     seq_chunk_bits: 2048
-    lanes: [1, 2]
-    issue_width: [1, 2]
     metadata:
       description: Softmax using a dedicated EXP2 unit; EXP2 replaces the six dependent FMA polynomial stages.
       lane_mapping: lanes becomes num_contexts; each lane is one independently runnable head context.
@@ -184,8 +200,6 @@ cases:
   - name: rmsnorm
     kernel: rmsnorm
     num_rows: 128
-    lanes: [1, 2]
-    issue_width: [1, 2]
     metadata:
       description: RMSNorm is modeled as per-row input, reduction, rescale, shared weight load, and output store.
       lane_mapping: each lane is one independently runnable row.
@@ -213,8 +227,6 @@ cases:
     kernel: silu
     exp2_unit: false
     num_rows: 128
-    lanes: [1, 2]
-    issue_width: [1, 2]
     metadata:
       description: SiLU using a six-FMA polynomial approximation for the exponent stage.
       lane_mapping: each lane is one independently runnable row.
@@ -247,8 +259,6 @@ cases:
     kernel: silu
     exp2_unit: true
     num_rows: 128
-    lanes: [1, 2]
-    issue_width: [1, 2]
     metadata:
       description: SiLU using a dedicated EXP2 unit; EXP2 replaces the six dependent FMA polynomial stages.
       lane_mapping: each lane is one independently runnable row.
@@ -275,8 +285,6 @@ cases:
   - name: rope
     kernel: rope
     num_rows: 128
-    lanes: [1, 2]
-    issue_width: [1, 2]
     metadata:
       description: RoPE mixes shared theta data with per-row input and output streams.
       lane_mapping: each lane is one independently runnable row or position block.
