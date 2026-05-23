@@ -1229,8 +1229,90 @@ class VectorProcessor:
                   f"{issue_pct:6.1f}%")
 
 
+def _max_loop_unroll_factor(logical_register_count: int,
+                            registers_per_iteration: int) -> int:
+    if logical_register_count < 1:
+        raise ValueError("logical_register_count must be at least 1")
+    if registers_per_iteration < 1:
+        raise ValueError("registers_per_iteration must be at least 1")
+    return max(1, logical_register_count // registers_per_iteration)
+
+
+def _resolve_loop_unroll_factor(kernel: str, loop_unroll: bool,
+                                logical_register_count: int,
+                                registers_per_iteration: int,
+                                loop_unroll_factor: Optional[int] = None) -> int:
+    if not loop_unroll:
+        factor = 1
+    elif loop_unroll_factor is None:
+        factor = _max_loop_unroll_factor(logical_register_count, registers_per_iteration)
+    else:
+        factor = int(loop_unroll_factor)
+
+    if factor < 1:
+        raise ValueError("loop_unroll_factor must be at least 1")
+    required = factor * registers_per_iteration
+    if required > logical_register_count:
+        raise ValueError(
+            f"{kernel} loop_unroll_factor={factor} needs {required} "
+            f"logical vector registers, but logical_register_count={logical_register_count}"
+        )
+    return factor
+
+
+def _kernel_registers_per_iteration(kernel: str, has_exp2_unit: bool) -> int:
+    if kernel == "softmax":
+        return 14
+    if kernel == "rmsnorm":
+        return 6
+    if kernel == "silu":
+        return 5 if has_exp2_unit else 10
+    if kernel == "rope":
+        return 5
+    raise ValueError(f"Unknown kernel: {kernel}")
+
+
+def resolve_loop_unroll_factor_for_kernel(kernel: str, has_exp2_unit: bool,
+                                          loop_unroll: bool,
+                                          logical_register_count: int,
+                                          loop_unroll_factor: Optional[int] = None) -> int:
+    return _resolve_loop_unroll_factor(
+        kernel,
+        loop_unroll,
+        logical_register_count,
+        _kernel_registers_per_iteration(kernel, has_exp2_unit),
+        loop_unroll_factor=loop_unroll_factor,
+    )
+
+
+def _loop_unroll_bank(instance_index: int, num_contexts: int, loop_unroll_factor: int) -> int:
+    if loop_unroll_factor <= 1:
+        return 0
+    return (instance_index // num_contexts) % loop_unroll_factor
+
+
+def _flatten_loop_unrolled_instances(instance_streams: List[List], loop_unroll_factor: int,
+                                     num_contexts: int) -> List:
+    if loop_unroll_factor <= 1:
+        return [wrapper for stream in instance_streams for wrapper in stream]
+
+    flattened = []
+    group_size = max(1, loop_unroll_factor * num_contexts)
+    for group_start in range(0, len(instance_streams), group_size):
+        group = instance_streams[group_start:group_start + group_size]
+        max_len = max((len(stream) for stream in group), default=0)
+        for inst_pos in range(max_len):
+            for stream in group:
+                if inst_pos < len(stream):
+                    flattened.append(stream[inst_pos])
+    return flattened
+
+
 def create_softmax_instruction_stream(reg_width, has_exp2_unit, num_heads, seq_chunk_bit,
-                                      num_contexts=1, lane_strides=None) -> List[Instruction]:
+                                      num_contexts=1, lane_strides=None,
+                                      logical_register_count=32,
+                                      loop_unroll=True,
+                                      loop_unroll_factor=None) -> List[Instruction]:
     """Create a sample instruction stream for softmax computation"""
     # Use custom data size (1024 bytes) for this example to maintain compatibility
     # with existing simulation, override the default 256 bytes
@@ -1238,6 +1320,14 @@ def create_softmax_instruction_stream(reg_width, has_exp2_unit, num_heads, seq_c
     explicit_split_count = seq_chunk_bit // reg_width
     assert explicit_split_count * reg_width == seq_chunk_bit
     data_size = reg_width
+    registers_per_chunk = 14
+    loop_unroll_factor = _resolve_loop_unroll_factor(
+        "softmax",
+        loop_unroll,
+        logical_register_count,
+        registers_per_chunk,
+        loop_unroll_factor=loop_unroll_factor,
+    )
     
     # Softmax typically involves:
     # 1. Load input data
@@ -1248,14 +1338,16 @@ def create_softmax_instruction_stream(reg_width, has_exp2_unit, num_heads, seq_c
     # 6. Divide by sum (FMA)
     # 7. Store result
 
-    all_insts = []
+    head_streams = []
 
     for h in range(num_heads):
         head_id = h*1000
         per_head_insts = []
+        logical_bank = _loop_unroll_bank(h, num_contexts, loop_unroll_factor)
+        logical_base = logical_bank * registers_per_chunk
 
         def lreg(chunk: int, slot: int) -> int:
-            return chunk * 100 + slot
+            return logical_base + slot
 
         max_reduce_fake_dest = []
         for i in range(explicit_split_count):
@@ -1364,13 +1456,21 @@ def create_softmax_instruction_stream(reg_width, has_exp2_unit, num_heads, seq_c
         for wrapper in per_head_insts:
             wrapper.instruction.context_id = ctx
 
-        all_insts.extend(per_head_insts)
+        head_streams.append(per_head_insts)
     
     # Extract the underlying Instruction objects for compatibility
+    all_insts = _flatten_loop_unrolled_instances(
+        head_streams,
+        loop_unroll_factor,
+        num_contexts,
+    )
     return [wrapper.instruction for wrapper in all_insts]
 
 
-def create_rmsnorm_instruction_stream(reg_width, num_rows, num_contexts=1, lane_strides=None) -> List[Instruction]:
+def create_rmsnorm_instruction_stream(reg_width, num_rows, num_contexts=1, lane_strides=None,
+                                      logical_register_count=32,
+                                      loop_unroll=True,
+                                      loop_unroll_factor=None) -> List[Instruction]:
     """Create an RMSNorm-like instruction stream.
 
     vlane0 models per-row input, vlane1 per-row output, and vlane2 shared
@@ -1378,193 +1478,271 @@ def create_rmsnorm_instruction_stream(reg_width, num_rows, num_contexts=1, lane_
     benefits from multiple contexts.
     """
     data_size = reg_width
-    all_insts = []
+    registers_per_row = 6
+    loop_unroll_factor = _resolve_loop_unroll_factor(
+        "rmsnorm",
+        loop_unroll,
+        logical_register_count,
+        registers_per_row,
+        loop_unroll_factor=loop_unroll_factor,
+    )
+    row_streams = []
 
     for row in range(num_rows):
         base = row * 100
+        logical_bank = _loop_unroll_bank(row, num_contexts, loop_unroll_factor)
+        logical_base = logical_bank * registers_per_row
+
+        def lreg(slot: int) -> int:
+            return logical_base + slot
+
         row_insts = [
             LoadInstruction(id=base + 0, target_register=base + 0,
                             data_size=data_size, vlane_ctx=0,
-                            logical_target_register=0),
+                            logical_target_register=lreg(0)),
             FMAInstruction(id=base + 1, target_register=base + 1,
                            source_registers=[base + 0], data_size=data_size,
-                           logical_target_register=1,
-                           logical_source_registers=[0]),
+                           logical_target_register=lreg(1),
+                           logical_source_registers=[lreg(0)]),
             ReduceInstruction(id=base + 2, target_register=base + 2,
                               source_registers=[base + 1], data_size=data_size,
-                              logical_target_register=2,
-                              logical_source_registers=[1]),
+                              logical_target_register=lreg(2),
+                              logical_source_registers=[lreg(1)]),
             FMAInstruction(id=base + 3, target_register=base + 3,
                            source_registers=[base + 0, base + 2],
                            dependencies=[base + 0, base + 2], data_size=data_size,
-                           logical_target_register=3,
-                           logical_source_registers=[0, 2]),
+                           logical_target_register=lreg(3),
+                           logical_source_registers=[lreg(0), lreg(2)]),
             LoadInstruction(id=base + 4, target_register=base + 4,
                             dependencies=[base + 3], data_size=data_size, vlane_ctx=2,
-                            logical_target_register=4),
+                            logical_target_register=lreg(4)),
             FMAInstruction(id=base + 5, target_register=base + 5,
                            source_registers=[base + 3, base + 4], data_size=data_size,
-                           logical_target_register=5,
-                           logical_source_registers=[3, 4]),
+                           logical_target_register=lreg(5),
+                           logical_source_registers=[lreg(3), lreg(4)]),
             StoreInstruction(id=base + 6, source_registers=[base + 5],
                              data_size=data_size, vlane_ctx=1,
-                             logical_source_registers=[5]),
+                             logical_source_registers=[lreg(5)]),
         ]
 
         ctx = row % num_contexts
         for wrapper in row_insts:
             wrapper.instruction.context_id = ctx
-        all_insts.extend(row_insts)
+        row_streams.append(row_insts)
 
+    all_insts = _flatten_loop_unrolled_instances(
+        row_streams,
+        loop_unroll_factor,
+        num_contexts,
+    )
     return [wrapper.instruction for wrapper in all_insts]
 
 
 def create_silu_instruction_stream(reg_width, has_exp2_unit, num_rows,
-                                   num_contexts=1, lane_strides=None) -> List[Instruction]:
+                                   num_contexts=1, lane_strides=None,
+                                   logical_register_count=32,
+                                   loop_unroll=True,
+                                   loop_unroll_factor=None) -> List[Instruction]:
     """Create a SiLU activation instruction stream."""
     data_size = reg_width
-    all_insts = []
+    registers_per_row = 5 if has_exp2_unit else 10
+    loop_unroll_factor = _resolve_loop_unroll_factor(
+        "silu",
+        loop_unroll,
+        logical_register_count,
+        registers_per_row,
+        loop_unroll_factor=loop_unroll_factor,
+    )
+    row_streams = []
 
     for row in range(num_rows):
         base = row * 100
+        logical_bank = _loop_unroll_bank(row, num_contexts, loop_unroll_factor)
+        logical_base = logical_bank * registers_per_row
+
+        def lreg(slot: int) -> int:
+            return logical_base + slot
+
         row_insts = [
             LoadInstruction(id=base + 0, target_register=base + 0,
                             data_size=data_size, vlane_ctx=0,
-                            logical_target_register=0),
+                            logical_target_register=lreg(0)),
             FMAInstruction(id=base + 1, target_register=base + 1,
                            source_registers=[base + 0], data_size=data_size,
-                           logical_target_register=1,
-                           logical_source_registers=[0]),
+                           logical_target_register=lreg(1),
+                           logical_source_registers=[lreg(0)]),
         ]
         if has_exp2_unit:
             row_insts += [
                 EXP2Instruction(id=base + 2, target_register=base + 2,
                                 source_registers=[base + 1], data_size=data_size,
-                                logical_target_register=2,
-                                logical_source_registers=[1]),
+                                logical_target_register=lreg(2),
+                                logical_source_registers=[lreg(1)]),
                 FMAInstruction(id=base + 3, target_register=base + 3,
                                source_registers=[base + 2], data_size=data_size,
-                               logical_target_register=3,
-                               logical_source_registers=[2]),
+                               logical_target_register=lreg(3),
+                               logical_source_registers=[lreg(2)]),
                 FMAInstruction(id=base + 4, target_register=base + 4,
                                source_registers=[base + 3], data_size=data_size,
-                               logical_target_register=4,
-                               logical_source_registers=[3]),
+                               logical_target_register=lreg(4),
+                               logical_source_registers=[lreg(3)]),
                 StoreInstruction(id=base + 5, source_registers=[base + 4],
                                  data_size=data_size, vlane_ctx=1,
-                                 logical_source_registers=[4]),
+                                 logical_source_registers=[lreg(4)]),
             ]
         else:
             row_insts += [
                 FMAInstruction(id=base + 2, target_register=base + 2,
                                source_registers=[base + 1], data_size=data_size,
-                               logical_target_register=2,
-                               logical_source_registers=[1]),
+                               logical_target_register=lreg(2),
+                               logical_source_registers=[lreg(1)]),
                 FMAInstruction(id=base + 3, target_register=base + 3,
                                source_registers=[base + 2], data_size=data_size,
-                               logical_target_register=3,
-                               logical_source_registers=[2]),
+                               logical_target_register=lreg(3),
+                               logical_source_registers=[lreg(2)]),
                 FMAInstruction(id=base + 4, target_register=base + 4,
                                source_registers=[base + 3], data_size=data_size,
-                               logical_target_register=4,
-                               logical_source_registers=[3]),
+                               logical_target_register=lreg(4),
+                               logical_source_registers=[lreg(3)]),
                 FMAInstruction(id=base + 5, target_register=base + 5,
                                source_registers=[base + 4], data_size=data_size,
-                               logical_target_register=5,
-                               logical_source_registers=[4]),
+                               logical_target_register=lreg(5),
+                               logical_source_registers=[lreg(4)]),
                 FMAInstruction(id=base + 6, target_register=base + 6,
                                source_registers=[base + 5], data_size=data_size,
-                               logical_target_register=6,
-                               logical_source_registers=[5]),
+                               logical_target_register=lreg(6),
+                               logical_source_registers=[lreg(5)]),
                 FMAInstruction(id=base + 7, target_register=base + 7,
                                source_registers=[base + 6], data_size=data_size,
-                               logical_target_register=7,
-                               logical_source_registers=[6]),
+                               logical_target_register=lreg(7),
+                               logical_source_registers=[lreg(6)]),
                 FMAInstruction(id=base + 8, target_register=base + 8,
                                source_registers=[base + 7], data_size=data_size,
-                               logical_target_register=8,
-                               logical_source_registers=[7]),
+                               logical_target_register=lreg(8),
+                               logical_source_registers=[lreg(7)]),
                 FMAInstruction(id=base + 9, target_register=base + 9,
                                source_registers=[base + 8], data_size=data_size,
-                               logical_target_register=9,
-                               logical_source_registers=[8]),
+                               logical_target_register=lreg(9),
+                               logical_source_registers=[lreg(8)]),
                 StoreInstruction(id=base + 10, source_registers=[base + 9],
                                  data_size=data_size, vlane_ctx=1,
-                                 logical_source_registers=[9]),
+                                 logical_source_registers=[lreg(9)]),
             ]
 
         ctx = row % num_contexts
         for wrapper in row_insts:
             wrapper.instruction.context_id = ctx
-        all_insts.extend(row_insts)
+        row_streams.append(row_insts)
 
+    all_insts = _flatten_loop_unrolled_instances(
+        row_streams,
+        loop_unroll_factor,
+        num_contexts,
+    )
     return [wrapper.instruction for wrapper in all_insts]
 
 
-def create_rope_instruction_stream(reg_width, num_rows, num_contexts=1, lane_strides=None) -> List[Instruction]:
+def create_rope_instruction_stream(reg_width, num_rows, num_contexts=1, lane_strides=None,
+                                   logical_register_count=32,
+                                   loop_unroll=True,
+                                   loop_unroll_factor=None) -> List[Instruction]:
     """Create a simplified RoPE instruction stream.
 
     vlane2 is used for shared theta, vlane0 for input, and vlane1 for output.
     The sin/cos polynomial expansion is abstracted as FMA work.
     """
     data_size = reg_width
-    all_insts = []
+    registers_per_row = 5
+    loop_unroll_factor = _resolve_loop_unroll_factor(
+        "rope",
+        loop_unroll,
+        logical_register_count,
+        registers_per_row,
+        loop_unroll_factor=loop_unroll_factor,
+    )
+    row_streams = []
 
     for row in range(num_rows):
         base = row * 100
+        logical_bank = _loop_unroll_bank(row, num_contexts, loop_unroll_factor)
+        logical_base = logical_bank * registers_per_row
+
+        def lreg(slot: int) -> int:
+            return logical_base + slot
+
         row_insts = [
             LoadInstruction(id=base + 0, target_register=base + 0,
                             data_size=data_size, vlane_ctx=2,
-                            logical_target_register=0),
+                            logical_target_register=lreg(0)),
             FMAInstruction(id=base + 1, target_register=base + 1,
                            source_registers=[base + 0], data_size=data_size,
-                           logical_target_register=1,
-                           logical_source_registers=[0]),
+                           logical_target_register=lreg(1),
+                           logical_source_registers=[lreg(0)]),
             LoadInstruction(id=base + 2, target_register=base + 2,
                             dependencies=[base + 1], data_size=data_size, vlane_ctx=0,
-                            logical_target_register=2),
+                            logical_target_register=lreg(2)),
             FMAInstruction(id=base + 3, target_register=base + 3,
                            source_registers=[base + 1, base + 2], data_size=data_size,
-                           logical_target_register=3,
-                           logical_source_registers=[1, 2]),
+                           logical_target_register=lreg(3),
+                           logical_source_registers=[lreg(1), lreg(2)]),
             FMAInstruction(id=base + 4, target_register=base + 4,
                            source_registers=[base + 1, base + 2, base + 3],
                            dependencies=[base + 1, base + 2, base + 3], data_size=data_size,
-                           logical_target_register=4,
-                           logical_source_registers=[1, 2, 3]),
+                           logical_target_register=lreg(4),
+                           logical_source_registers=[lreg(1), lreg(2), lreg(3)]),
             StoreInstruction(id=base + 5, source_registers=[base + 3, base + 4],
                              data_size=data_size, vlane_ctx=1,
-                             logical_source_registers=[3, 4]),
+                             logical_source_registers=[lreg(3), lreg(4)]),
         ]
 
         ctx = row % num_contexts
         for wrapper in row_insts:
             wrapper.instruction.context_id = ctx
-        all_insts.extend(row_insts)
+        row_streams.append(row_insts)
 
+    all_insts = _flatten_loop_unrolled_instances(
+        row_streams,
+        loop_unroll_factor,
+        num_contexts,
+    )
     return [wrapper.instruction for wrapper in all_insts]
 
 
 def create_instruction_stream(kernel, reg_width, has_exp2_unit, num_heads, num_rows,
-                              seq_chunk_bits, num_contexts=1, lane_strides=None) -> List[Instruction]:
+                              seq_chunk_bits, num_contexts=1, lane_strides=None,
+                              logical_register_count=32,
+                              loop_unroll=True,
+                              loop_unroll_factor=None) -> List[Instruction]:
     """Create a kernel-specific instruction stream with a common interface."""
     if kernel == "softmax":
         return create_softmax_instruction_stream(
             reg_width, has_exp2_unit, num_heads, seq_chunk_bits,
             num_contexts=num_contexts, lane_strides=lane_strides,
+            logical_register_count=logical_register_count,
+            loop_unroll=loop_unroll,
+            loop_unroll_factor=loop_unroll_factor,
         )
     if kernel == "rmsnorm":
         return create_rmsnorm_instruction_stream(
             reg_width, num_rows, num_contexts=num_contexts, lane_strides=lane_strides,
+            logical_register_count=logical_register_count,
+            loop_unroll=loop_unroll,
+            loop_unroll_factor=loop_unroll_factor,
         )
     if kernel == "silu":
         return create_silu_instruction_stream(
             reg_width, has_exp2_unit, num_rows,
             num_contexts=num_contexts, lane_strides=lane_strides,
+            logical_register_count=logical_register_count,
+            loop_unroll=loop_unroll,
+            loop_unroll_factor=loop_unroll_factor,
         )
     if kernel == "rope":
         return create_rope_instruction_stream(
             reg_width, num_rows, num_contexts=num_contexts, lane_strides=lane_strides,
+            logical_register_count=logical_register_count,
+            loop_unroll=loop_unroll,
+            loop_unroll_factor=loop_unroll_factor,
         )
     raise ValueError(f"Unknown kernel: {kernel}")
 
@@ -1619,6 +1797,9 @@ def run_kernel_simulation(args, kernel=None, num_contexts=None, issue_width=None
         args.seq_chunk_bits,
         num_contexts=selected_contexts,
         lane_strides=lane_strides,
+        logical_register_count=args.logical_register_count,
+        loop_unroll=args.loop_unroll,
+        loop_unroll_factor=args.loop_unroll_factor,
     )
     for inst in instructions:
         if inst.type in [InstructionType.LOAD, InstructionType.STORE] and inst.vlane_ctx >= len(lane_strides):
@@ -1657,6 +1838,14 @@ BENCHMARK_ALIASES = {
     'scheduler_window_size': 'ooo_scheduler_window_size',
     'issue-queue-window': 'issue_queue_window',
     'register-renaming': 'register_renaming',
+    'logical-register-count': 'logical_register_count',
+    'logical_registers': 'logical_register_count',
+    'logical-registers': 'logical_register_count',
+    'loop-unroll-factor': 'loop_unroll_factor',
+    'unroll-factor': 'loop_unroll_factor',
+    'loop-unroll': 'loop_unroll',
+    'loop_unroll': 'loop_unroll',
+    'unroll': 'loop_unroll',
 }
 
 BENCHMARK_INT_FIELDS = {
@@ -1677,10 +1866,18 @@ BENCHMARK_INT_FIELDS = {
     'lane_stride_1',
     'lane_stride_2',
     'lane_stride_3',
+    'logical_register_count',
+    'loop_unroll_factor',
     'max_cycles',
 }
 
-BENCHMARK_BOOL_FIELDS = {'exp2_unit', 'chaining', 'quiet', 'register_renaming'}
+BENCHMARK_BOOL_FIELDS = {
+    'exp2_unit',
+    'chaining',
+    'quiet',
+    'register_renaming',
+    'loop_unroll',
+}
 BENCHMARK_METADATA_KEYS = {
     'metadata',
     'description',
@@ -2011,6 +2208,13 @@ def _run_benchmark_case(args, case: Dict) -> Dict:
     case_args = _apply_benchmark_case(args, case)
     results, processor, instructions = run_kernel_simulation(case_args, quiet=True)
     metrics = processor.get_utilization_metrics()
+    effective_loop_unroll_factor = resolve_loop_unroll_factor_for_kernel(
+        case_args.kernel,
+        case_args.exp2_unit,
+        case_args.loop_unroll,
+        case_args.logical_register_count,
+        loop_unroll_factor=case_args.loop_unroll_factor,
+    )
     metadata = case.get('metadata', {})
     if not isinstance(metadata, dict):
         metadata = {}
@@ -2056,6 +2260,9 @@ def _run_benchmark_case(args, case: Dict) -> Dict:
         'all_compute_widths': case_args.all_compute_widths,
         'chaining': case_args.chaining,
         'register_renaming': case_args.register_renaming,
+        'logical_register_count': case_args.logical_register_count,
+        'loop_unroll': case_args.loop_unroll,
+        'loop_unroll_factor': effective_loop_unroll_factor,
         'issue_queue_window': case_args.issue_queue_window,
         'ooo_scheduler_window_size': case_args.ooo_scheduler_window_size,
         'lane_strides': (
@@ -2093,6 +2300,9 @@ def _benchmark_baseline_key(row: Dict) -> Tuple:
         row['complex_elementwise_width'],
         row['all_compute_widths'],
         row['chaining'],
+        row['logical_register_count'],
+        row['loop_unroll'],
+        row['loop_unroll_factor'],
         row['register_renaming'],
         row['issue_queue_window'],
         row['ooo_scheduler_window_size'],
@@ -2240,6 +2450,9 @@ def run_benchmark_suite(args) -> str:
         f"- issue queue windows: `{_format_benchmark_values(rows, 'issue_queue_window')}` not-yet-completed uops",
         f"- out-of-order scheduler window sizes: `{_format_benchmark_values(rows, 'ooo_scheduler_window_size')}` not-yet-issued uops",
         f"- register widths: `{_format_benchmark_values(rows, 'register_width')}` bits",
+        f"- logical vector registers: `{_format_benchmark_values(rows, 'logical_register_count')}`",
+        f"- loop unroll enabled: `{_format_benchmark_values(rows, 'loop_unroll')}`",
+        f"- effective loop unroll factors: `{_format_benchmark_values(rows, 'loop_unroll_factor')}`",
         f"- sequence chunks: `{_format_benchmark_values(rows, 'seq_chunk_bits')}` bits",
         f"- rows per non-softmax kernel: `{_format_benchmark_values(rows, 'num_rows')}`",
         f"- softmax heads: `{_format_benchmark_values(rows, 'num_heads')}`",
@@ -2486,6 +2699,35 @@ def parse_arguments():
     )
 
     parser.add_argument(
+        "--logical-register-count",
+        type=int,
+        default=32,
+        help="Architectural logical vector registers available per context"
+    )
+
+    unroll_group = parser.add_mutually_exclusive_group()
+    unroll_group.add_argument(
+        "--loop-unroll",
+        dest="loop_unroll",
+        action="store_true",
+        default=True,
+        help="Enable compiler loop unroll to the maximum factor that fits the logical register budget"
+    )
+    unroll_group.add_argument(
+        "--no-loop-unroll",
+        dest="loop_unroll",
+        action="store_false",
+        help="Disable compiler loop unroll and reuse one logical-register bank"
+    )
+
+    parser.add_argument(
+        "--loop-unroll-factor",
+        type=int,
+        default=None,
+        help="Compatibility override for an explicit loop unroll factor"
+    )
+
+    parser.add_argument(
         "--lane-stride-0",
         type=int,
         default=0,
@@ -2598,6 +2840,16 @@ def main():
         print(f"  OOO scheduler window: {args.ooo_scheduler_window_size} uops")
         print(f"  Chaining: {'enabled' if args.chaining else 'disabled'}")
         print(f"  num_contexts: {args.num_contexts}")
+        print(f"  logical registers: {args.logical_register_count}")
+        effective_loop_unroll_factor = resolve_loop_unroll_factor_for_kernel(
+            args.kernel,
+            args.exp2_unit,
+            args.loop_unroll,
+            args.logical_register_count,
+            loop_unroll_factor=args.loop_unroll_factor,
+        )
+        print(f"  loop unroll: {'enabled' if args.loop_unroll else 'disabled'}")
+        print(f"  effective loop unroll factor: {effective_loop_unroll_factor}")
         print(f"  lane strides: ({args.lane_stride_0}, {args.lane_stride_1}, {args.lane_stride_2}, {args.lane_stride_3})")
         print()
 

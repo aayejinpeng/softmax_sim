@@ -10,6 +10,8 @@
 # - lanes -> num_contexts, i.e. how many independent lane contexts can run in parallel
 # - execution_mode -> in-order or out-of-order issue scheduling
 # - register_renaming -> true lets independent heads/rows reuse logical registers without false hazards
+# - loop_unroll -> compiler-level software unroll; true expands to the maximum head/row count that fits logical_register_count
+# - logical_register_count -> logical vector register budget per context; unrolled heads/rows get distinct logical-register banks
 # - issue_queue_window -> oldest not-yet-completed uops visible to both schedulers
 # - ooo_scheduler_window_size -> oldest not-yet-issued uops the out-of-order scheduler can choose from inside the issue queue window
 # - issue_width -> max uops issued per cycle across all active lanes
@@ -54,9 +56,12 @@
 
 defaults:
   chaining: true
+  logical_register_count: 32
+  loop_unroll: true
 
 baseline: 
   execution_mode: in-order
+  register_renaming: false
   register_width: 512
   cache_bandwidth: 64  # bytes per cycle
   all_compute_widths: 512
@@ -69,6 +74,7 @@ hardware_configs:
     execution_mode: in-order
     register_width: 512
     cache_bandwidth: 64  # bytes per cycle
+    register_renaming: false
     all_compute_widths: 512
     lanes: [1, 2]
     issue_width: [1, 2]
@@ -174,6 +180,8 @@ cases:
       parameter_notes:
         num_heads: number of independent attention heads to simulate.
         seq_chunk_bits: input size per head; larger values increase the number of vector-sized chunks per head.
+        loop_unroll: compiler-level head unroll; when enabled, the compiler expands to the maximum number of heads that fits logical_register_count.
+        logical_register_count: logical vector register budget; unrolled heads use disjoint logical-register banks so no-renaming hardware can expose more TLP without full physical renaming.
         exp2_unit: false selects the FMA polynomial path. These six FMA instructions are an implementation alternative to the single EXP2 instruction in softmax_exp2_unit.
         fma_exp_dependencies: I03 depends on I02; I04 depends on I03; I05 depends on I04; I06 depends on I05; I07 depends on I06; I08 depends on I07.
         exp_result_fanout: I08 is the exp result. I09 STORE(exp scratch) and I10 REDUCE(sum exp) both depend on I08.
@@ -209,6 +217,8 @@ cases:
       parameter_notes:
         num_heads: number of independent attention heads to simulate.
         seq_chunk_bits: input size per head; larger values increase the number of vector-sized chunks per head.
+        loop_unroll: compiler-level head unroll; when enabled, the compiler expands to the maximum number of heads that fits logical_register_count.
+        logical_register_count: logical vector register budget; unrolled heads use disjoint logical-register banks so no-renaming hardware can expose more TLP without full physical renaming.
         exp2_unit: true selects the dedicated EXP2 path. I08 EXP2 replaces I03-I08 from softmax_fma_exp_approx and produces the same logical exp result for downstream users.
         exp2_dependency: I08 EXP2 depends on I02 LOAD(input/sub source), which already waits for all max reductions for this head.
         exp_result_fanout: I09 STORE(exp scratch) and I10 REDUCE(sum exp) both depend on I08.
@@ -239,6 +249,8 @@ cases:
         cycle 046-056  I06 STORE(output)           latency 10
       parameter_notes:
         num_rows: number of independent rows to simulate.
+        loop_unroll: compiler-level row unroll; when enabled, the compiler expands to the maximum number of rows that fits logical_register_count.
+        logical_register_count: logical vector register budget; unrolled rows use disjoint logical-register banks while staying within the architectural register file.
         lanes: number of independent contexts that can issue in parallel.
         issue_width: maximum uops issued per cycle across all lanes.
         lane_stride_0: per-row input stride for vlane0 loads.
@@ -271,6 +283,8 @@ cases:
       parameter_notes:
         num_rows: number of independent rows to simulate.
         exp2_unit: false selects the FMA polynomial exponent path. These six FMA instructions are an implementation alternative to the single EXP2 instruction in silu_exp2_unit.
+        loop_unroll: compiler-level row unroll; when enabled, the compiler expands to the maximum number of rows that fits logical_register_count.
+        logical_register_count: logical vector register budget; unrolled rows use disjoint logical-register banks while staying within the architectural register file.
         fma_exp_dependencies: I02 depends on I01; I03 depends on I02; I04 depends on I03; I05 depends on I04; I06 depends on I05; I07 depends on I06.
         lanes: number of independent contexts that can issue in parallel.
         issue_width: maximum uops issued per cycle across all lanes.
@@ -298,6 +312,8 @@ cases:
       parameter_notes:
         num_rows: number of independent rows to simulate.
         exp2_unit: true selects the dedicated EXP2 path. I02 EXP2 replaces I02-I07 from silu_fma_exp_approx and produces the same logical exponent result for downstream users.
+        loop_unroll: compiler-level row unroll; when enabled, the compiler expands to the maximum number of rows that fits logical_register_count.
+        logical_register_count: logical vector register budget; unrolled rows use disjoint logical-register banks while staying within the architectural register file.
         exp2_dependency: I02 EXP2 depends on I01 FMA(negate).
         lanes: number of independent contexts that can issue in parallel.
         issue_width: maximum uops issued per cycle across all lanes.
@@ -323,6 +339,8 @@ cases:
         cycle 032-042  I05 STORE(output)           latency 10
       parameter_notes:
         num_rows: number of independent rows to simulate.
+        loop_unroll: compiler-level row unroll; when enabled, the compiler expands to the maximum number of rows that fits logical_register_count.
+        logical_register_count: logical vector register budget; unrolled rows use disjoint logical-register banks while staying within the architectural register file.
         lanes: number of independent contexts that can issue in parallel.
         issue_width: maximum uops issued per cycle across all lanes.
         lane_stride_0: per-row input stride for vlane0 loads.
