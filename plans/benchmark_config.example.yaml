@@ -1,6 +1,8 @@
 # Benchmark config anatomy
 #
-# - defaults: hardware / simulator knobs shared by every case
+# - defaults: simulator knobs shared by every visible case and hidden baseline case
+# - baseline: hidden per-workload reference used for baseline speedup normalization
+# - hardware_configs: hardware / scheduling sweeps crossed with every visible case
 # - cases: workload-specific cases
 # - metadata: documentation only; ignored by the simulator, preserved in the report
 #
@@ -65,6 +67,26 @@ baseline:
 hardware_configs:
   - name: vw512_bw64_inorder
     execution_mode: in-order
+    register_width: 512
+    cache_bandwidth: 64  # bytes per cycle
+    all_compute_widths: 512
+    lanes: [1, 2]
+    issue_width: [1, 2]
+  - name: vw512_bw64_ooo_norename_2iq_2sch
+    execution_mode: out-of-order
+    register_renaming: false
+    issue_queue_window: 4
+    ooo_scheduler_window_size: 4
+    register_width: 512
+    cache_bandwidth: 64  # bytes per cycle
+    all_compute_widths: 512
+    lanes: [1, 2]
+    issue_width: [1, 2]
+  - name: vw512_bw64_ooo_norename_4iq_4sch
+    execution_mode: out-of-order
+    register_renaming: false
+    issue_queue_window: 4
+    ooo_scheduler_window_size: 4
     register_width: 512
     cache_bandwidth: 64  # bytes per cycle
     all_compute_widths: 512

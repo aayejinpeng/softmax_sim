@@ -1694,6 +1694,30 @@ BENCHMARK_METADATA_KEYS = {
 }
 
 
+def _metadata_with_updates(case: Dict, updates: Dict) -> Dict:
+    """Return a shallow case copy with metadata keys added."""
+    merged = case.copy()
+    metadata = merged.get('metadata', {})
+    if not isinstance(metadata, dict):
+        metadata = {}
+    metadata = metadata.copy()
+    for key, value in updates.items():
+        if value is not None:
+            metadata[key] = value
+    merged['metadata'] = metadata
+    return merged
+
+
+def _benchmark_case_workload_name(raw_case: Dict, index: int) -> str:
+    name = raw_case.get('name')
+    if name:
+        return str(name)
+    kernel = raw_case.get('kernel')
+    if kernel:
+        return str(kernel)
+    return f"case_{index}"
+
+
 def _normalize_benchmark_key(key: str) -> str:
     normalized = key.strip().replace('-', '_')
     return BENCHMARK_ALIASES.get(normalized, normalized)
@@ -1822,7 +1846,7 @@ def _default_benchmark_cases() -> List[Dict]:
     return cases
 
 
-def _load_yaml_benchmark_cases(path: str) -> Tuple[List[Dict], Dict]:
+def _load_yaml_benchmark_cases(path: str) -> Tuple[List[Dict], Dict, List[Dict], Optional[Dict]]:
     try:
         import yaml
     except ImportError as exc:
@@ -1834,13 +1858,16 @@ def _load_yaml_benchmark_cases(path: str) -> Tuple[List[Dict], Dict]:
         data = yaml.safe_load(f)
 
     if data is None:
-        return [], {}
+        return [], {}, [], None
     if isinstance(data, list):
-        return data, {}
+        return data, {}, [], None
     if not isinstance(data, dict):
         raise ValueError("YAML benchmark config must be a list or mapping")
 
     defaults = data.get('defaults', {})
+    baseline = data.get('baseline')
+    if baseline is not None and not isinstance(baseline, dict):
+        raise ValueError("YAML baseline must be a mapping")
     hardware_configs = data.get('hardware_configs') or data.get('hardware') or [{}]
     if isinstance(hardware_configs, dict):
         hardware_configs = [hardware_configs]
@@ -1856,10 +1883,34 @@ def _load_yaml_benchmark_cases(path: str) -> Tuple[List[Dict], Dict]:
     if not raw_cases:
         raw_cases = [
             {key: value for key, value in data.items()
-             if key not in {'defaults', 'hardware_configs', 'hardware'}}
+             if key not in {'defaults', 'baseline', 'hardware_configs', 'hardware'}}
         ]
 
     combined_cases = []
+    baseline_cases = []
+    for case_index, raw_case in enumerate(raw_cases):
+        if raw_case is None:
+            continue
+        if not isinstance(raw_case, dict):
+            raise ValueError(f"Benchmark case must be a mapping, got {type(raw_case).__name__}")
+
+        workload_name = _benchmark_case_workload_name(raw_case, case_index)
+        if baseline is not None:
+            baseline_case = raw_case.copy()
+            baseline_case.update(baseline)
+            baseline_name = baseline.get('name')
+            baseline_case['name'] = (
+                f"{baseline_name}/{workload_name}" if baseline_name else f"baseline/{workload_name}"
+            )
+            baseline_cases.append(_metadata_with_updates(
+                baseline_case,
+                {
+                    'baseline_reference': True,
+                    'hardware_config': baseline.get('name', 'baseline'),
+                    'workload_name': workload_name,
+                },
+            ))
+
     for hardware in hardware_configs:
         if hardware is None:
             hardware = {}
@@ -1867,48 +1918,43 @@ def _load_yaml_benchmark_cases(path: str) -> Tuple[List[Dict], Dict]:
             raise ValueError(f"Hardware config must be a mapping, got {type(hardware).__name__}")
         hardware_name = hardware.get('name')
         hardware_fields = {key: value for key, value in hardware.items() if key != 'name'}
-        for raw_case in raw_cases:
+        for case_index, raw_case in enumerate(raw_cases):
             if raw_case is None:
                 continue
             if not isinstance(raw_case, dict):
                 raise ValueError(f"Benchmark case must be a mapping, got {type(raw_case).__name__}")
+            workload_name = _benchmark_case_workload_name(raw_case, case_index)
             merged = hardware_fields.copy()
             merged.update(raw_case)
             if hardware_name is not None:
-                metadata = merged.get('metadata', {})
-                if not isinstance(metadata, dict):
-                    metadata = {}
-                metadata = metadata.copy()
-                metadata.setdefault('hardware_config', hardware_name)
-                merged['metadata'] = metadata
+                merged = _metadata_with_updates(
+                    merged,
+                    {
+                        'hardware_config': hardware_name,
+                        'workload_name': workload_name,
+                    },
+                )
                 if merged.get('name'):
                     merged['name'] = f"{hardware_name}/{merged['name']}"
+            else:
+                merged = _metadata_with_updates(merged, {'workload_name': workload_name})
             combined_cases.append(merged)
 
-    return combined_cases, defaults
+    return combined_cases, defaults, baseline_cases, baseline
 
 
-def _load_csv_benchmark_cases(path: str) -> Tuple[List[Dict], Dict]:
+def _load_csv_benchmark_cases(path: str) -> Tuple[List[Dict], Dict, List[Dict], Optional[Dict]]:
     with open(path, "r", encoding="utf-8", newline="") as f:
         reader = csv.DictReader(
             line for line in f
             if line.strip() and not line.lstrip().startswith("#")
         )
         if reader.fieldnames is None:
-            return [], {}
-        return [dict(row) for row in reader], {}
+            return [], {}, [], None
+        return [dict(row) for row in reader], {}, [], None
 
 
-def load_benchmark_cases(path: str) -> List[Dict]:
-    """Load benchmark cases from CSV or YAML and expand sweep fields."""
-    suffix = path.rsplit(".", 1)[-1].lower() if "." in path else ""
-    if suffix in {"yaml", "yml"}:
-        raw_cases, defaults = _load_yaml_benchmark_cases(path)
-    elif suffix == "csv":
-        raw_cases, defaults = _load_csv_benchmark_cases(path)
-    else:
-        raise ValueError("Benchmark config must use .csv, .yaml, or .yml")
-
+def _expand_benchmark_cases_with_defaults(raw_cases: List[Dict], defaults: Dict) -> List[Dict]:
     cases = []
     normalized_defaults = {}
     for key, value in defaults.items():
@@ -1924,6 +1970,27 @@ def load_benchmark_cases(path: str) -> List[Dict]:
         merged.update(raw_case)
         cases.extend(_expand_benchmark_case(merged))
 
+    return cases
+
+
+def load_benchmark_suite_cases(path: str) -> Tuple[List[Dict], List[Dict], Optional[Dict]]:
+    """Load visible benchmark cases plus optional hidden baseline cases."""
+    suffix = path.rsplit(".", 1)[-1].lower() if "." in path else ""
+    if suffix in {"yaml", "yml"}:
+        raw_cases, defaults, raw_baseline_cases, baseline = _load_yaml_benchmark_cases(path)
+    elif suffix == "csv":
+        raw_cases, defaults, raw_baseline_cases, baseline = _load_csv_benchmark_cases(path)
+    else:
+        raise ValueError("Benchmark config must use .csv, .yaml, or .yml")
+
+    cases = _expand_benchmark_cases_with_defaults(raw_cases, defaults)
+    baseline_cases = _expand_benchmark_cases_with_defaults(raw_baseline_cases, defaults)
+    return cases, baseline_cases, baseline
+
+
+def load_benchmark_cases(path: str) -> List[Dict]:
+    """Load visible benchmark cases from CSV or YAML and expand sweep fields."""
+    cases, _, _ = load_benchmark_suite_cases(path)
     return cases
 
 
@@ -1951,8 +2018,14 @@ def _run_benchmark_case(args, case: Dict) -> Dict:
     dependency_chain = case.get('dependency_chain') or metadata.get('dependency_chain', '')
     latency_diagram = case.get('latency_diagram') or metadata.get('latency_diagram', '')
     parameter_notes = case.get('parameter_notes') or metadata.get('parameter_notes', {})
+    workload_name = str(metadata.get('workload_name') or case.get('name', '') or case_args.kernel)
+    hardware_config = str(metadata.get('hardware_config', ''))
+    baseline_reference = bool(metadata.get('baseline_reference', False))
     return {
         'name': str(case.get('name', '')),
+        'workload_name': workload_name,
+        'hardware_config': hardware_config,
+        'baseline_reference': baseline_reference,
         'description': str(description),
         'dependency_chain': str(dependency_chain),
         'latency_diagram': str(latency_diagram),
@@ -1964,7 +2037,6 @@ def _run_benchmark_case(args, case: Dict) -> Dict:
         'issue_width': case_args.issue_width,
         'cycles': results['total_cycles'],
         'speedup': 1.0,
-        'ooo_speedup': None,
         'issue_util': metrics['issue_slot_utilization'],
         'load_util': metrics['unit_active_pct']['load'],
         'store_util': metrics['unit_active_pct']['store'],
@@ -1994,34 +2066,21 @@ def _run_benchmark_case(args, case: Dict) -> Dict:
         ),
     }
 
-
-def _benchmark_mode_compare_key(row: Dict) -> Tuple:
+def _benchmark_workload_key(row: Dict) -> Tuple:
     return (
-        row['name'],
+        row.get('workload_name') or row['name'],
         row['kernel'],
         row['exp2_unit'],
-        row['lanes'],
-        row['issue_width'],
         row['num_heads'],
         row['num_rows'],
         row['seq_chunk_bits'],
-        row['register_width'],
-        row['cache_bandwidth'],
-        row['reduce_compute_width'],
-        row['simple_elementwise_width'],
-        row['complex_elementwise_width'],
-        row['all_compute_widths'],
         row['chaining'],
-        row['register_renaming'],
-        row['issue_queue_window'],
-        row['ooo_scheduler_window_size'],
-        row['lane_strides'],
     )
 
 
 def _benchmark_baseline_key(row: Dict) -> Tuple:
     return (
-        row['name'],
+        row.get('workload_name') or row['name'],
         row['kernel'],
         row['exp2_unit'],
         row['num_heads'],
@@ -2041,25 +2100,27 @@ def _benchmark_baseline_key(row: Dict) -> Tuple:
     )
 
 
-def _annotate_speedups(rows: List[Dict]):
+def _annotate_speedups(rows: List[Dict], baseline_rows: List[Dict] = None):
+    baseline_rows = baseline_rows or []
+    explicit_baseline_by_workload = {}
     baseline_by_config = {}
-    in_order_cycles_by_config = {}
+
+    for row in baseline_rows:
+        explicit_baseline_by_workload.setdefault(_benchmark_workload_key(row), row['cycles'])
 
     for row in rows:
         if (row['execution_mode'] == 'in-order' and
                 row['lanes'] == 1 and row['issue_width'] == 1):
             baseline_by_config.setdefault(_benchmark_baseline_key(row), row['cycles'])
-        if row['execution_mode'] == 'in-order':
-            in_order_cycles_by_config.setdefault(_benchmark_mode_compare_key(row), row['cycles'])
 
     for row in rows:
         baseline_by_config.setdefault(_benchmark_baseline_key(row), row['cycles'])
 
     for row in rows:
-        baseline_cycles = baseline_by_config[_benchmark_baseline_key(row)]
+        baseline_cycles = explicit_baseline_by_workload.get(_benchmark_workload_key(row))
+        if baseline_cycles is None:
+            baseline_cycles = baseline_by_config[_benchmark_baseline_key(row)]
         row['speedup'] = baseline_cycles / row['cycles'] if row['cycles'] else 0.0
-        in_order_cycles = in_order_cycles_by_config.get(_benchmark_mode_compare_key(row))
-        row['ooo_speedup'] = in_order_cycles / row['cycles'] if in_order_cycles and row['cycles'] else None
 
 
 def _format_benchmark_values(rows: List[Dict], key: str) -> str:
@@ -2070,6 +2131,50 @@ def _format_benchmark_values(rows: List[Dict], key: str) -> str:
         if value not in values:
             values.append(value)
     return ", ".join(str(value) for value in values)
+
+
+def _format_baseline_config(baseline_config: Optional[Dict]) -> str:
+    if not baseline_config:
+        return "matching in-order lanes=1 issue_width=1 cases"
+
+    fields = []
+    for key, value in baseline_config.items():
+        if key == 'name' or key in BENCHMARK_METADATA_KEYS:
+            continue
+        normalized_key = _normalize_benchmark_key(str(key))
+        fields.append(f"{normalized_key}={value}")
+    return ", ".join(fields) if fields else "top-level YAML baseline"
+
+
+def _benchmark_case_title(row: Dict) -> str:
+    title = row.get('workload_name') or row.get('kernel') or row.get('name') or 'case'
+    return str(title)
+
+
+def _benchmark_hardware_label(row: Dict) -> str:
+    label = row.get('hardware_config') or ''
+    if label:
+        return str(label)
+
+    name = str(row.get('name', ''))
+    if '/' in name:
+        prefix = name.split('/', 1)[0]
+        if prefix:
+            return prefix
+
+    return '-'
+
+
+def _benchmark_row_sort_key(row: Dict) -> Tuple:
+    return (
+        -row['cycles'],
+        _benchmark_hardware_label(row),
+        row['execution_mode'],
+        row['register_renaming'],
+        row['lanes'],
+        row['issue_width'],
+        row.get('name', ''),
+    )
 
 
 def _resolve_benchmark_workers(args, case_count: int) -> int:
@@ -2085,29 +2190,40 @@ def _resolve_benchmark_workers(args, case_count: int) -> int:
 def run_benchmark_suite(args) -> str:
     """Run a compact multi-kernel, multi-lane benchmark and return Markdown."""
     if args.benchmark_config:
-        cases = load_benchmark_cases(args.benchmark_config)
+        cases, baseline_cases, baseline_config = load_benchmark_suite_cases(args.benchmark_config)
         source = args.benchmark_config
     else:
         cases = _default_benchmark_cases()
+        baseline_cases = []
+        baseline_config = None
         source = "built-in default sweep"
 
     if not cases:
         raise ValueError("No benchmark cases to run")
 
-    benchmark_workers = _resolve_benchmark_workers(args, len(cases))
+    all_run_cases = cases + baseline_cases
+    benchmark_workers = _resolve_benchmark_workers(args, len(all_run_cases))
     if benchmark_workers > 1:
         with concurrent.futures.ProcessPoolExecutor(max_workers=benchmark_workers) as executor:
-            futures = [executor.submit(_run_benchmark_case, args, case) for case in cases]
-            rows = [future.result() for future in futures]
+            futures = [executor.submit(_run_benchmark_case, args, case) for case in all_run_cases]
+            all_rows = [future.result() for future in futures]
     else:
-        rows = [_run_benchmark_case(args, case) for case in cases]
-    _annotate_speedups(rows)
-    has_case_names = any(row['name'] for row in rows)
-    has_case_descriptions = any(row['description'] for row in rows)
-    has_case_notes = any(
-        row['description'] or row['dependency_chain'] or row['latency_diagram'] or row['parameter_notes']
-        for row in rows
-    )
+        all_rows = [_run_benchmark_case(args, case) for case in all_run_cases]
+
+    rows = all_rows[:len(cases)]
+    baseline_rows = all_rows[len(cases):]
+    _annotate_speedups(rows, baseline_rows)
+
+    cases_by_title = {}
+    case_order = []
+    for row in rows:
+        title = _benchmark_case_title(row)
+        if title not in cases_by_title:
+            cases_by_title[title] = []
+            case_order.append(title)
+        cases_by_title[title].append(row)
+    for title in case_order:
+        cases_by_title[title].sort(key=_benchmark_row_sort_key)
 
     lines = [
         "# Multi-Kernel Benchmark Results",
@@ -2118,6 +2234,7 @@ def run_benchmark_suite(args) -> str:
         "",
         f"- benchmark source: `{source}`",
         f"- benchmark workers: `{benchmark_workers}`",
+        f"- baseline reference: `{_format_baseline_config(baseline_config)}`",
         f"- execution modes: `{_format_benchmark_values(rows, 'execution_mode')}`",
         f"- register renaming: `{_format_benchmark_values(rows, 'register_renaming')}`",
         f"- issue queue windows: `{_format_benchmark_values(rows, 'issue_queue_window')}` not-yet-completed uops",
@@ -2130,52 +2247,47 @@ def run_benchmark_suite(args) -> str:
         f"- all compute widths: `{_format_benchmark_values(rows, 'all_compute_widths')}` bits",
         f"- exp2 unit values: `{_format_benchmark_values(rows, 'exp2_unit')}`",
         "",
-        "`baseline speedup` is normalized per kernel to the matching in-order `lanes=1, issue_width=1` case when present; otherwise the first case for that kernel is used.",
-        "`ooo speedup` compares each row against the matching in-order case with the same case/kernel/lanes/issue_width/workload/hardware settings.",
+        "`baseline speedup` is normalized per workload to the top-level YAML `baseline` when present; otherwise it uses the matching in-order `lanes=1, issue_width=1` case.",
+        "Rows inside each case are sorted by cycle count from high to low.",
         "",
         "## Summary",
         "",
     ]
 
-    if has_case_names and has_case_descriptions:
-        lines.extend([
-            "| case | description | kernel | mode | rename | lanes | issue width | cycles | baseline speedup | ooo speedup | issue util | load | store | fma | reduce | exp2 |",
-            "|---|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
-        ])
-    elif has_case_names:
-        lines.extend([
-            "| case | kernel | mode | rename | lanes | issue width | cycles | baseline speedup | ooo speedup | issue util | load | store | fma | reduce | exp2 |",
-            "|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
-        ])
-    else:
-        lines.extend([
-            "| kernel | mode | rename | lanes | issue width | cycles | baseline speedup | ooo speedup | issue util | load | store | fma | reduce | exp2 |",
-            "|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
-        ])
+    summary_header = [
+        "| hardware | mode | rename | lanes | issue width | cycles | baseline speedup | issue util | load | store | fma | reduce | exp2 |",
+        "|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+    ]
+    mix_header = [
+        "| hardware | mode | rename | lanes | issue width | instructions | micro-ops |",
+        "|---|---|---|---:|---:|---:|---:|",
+    ]
 
-    for row in rows:
-        row_cells = [
-            _md_cell(row['kernel']),
-            _md_cell(row['execution_mode']),
-            str(row['register_renaming']),
-            str(row['lanes']),
-            str(row['issue_width']),
-            str(row['cycles']),
-            f"{row['speedup']:.2f}x",
-            f"{row['ooo_speedup']:.2f}x" if row['ooo_speedup'] is not None else "-",
-            f"{row['issue_util']:.1f}%",
-            f"{row['load_util']:.1f}%",
-            f"{row['store_util']:.1f}%",
-            f"{row['fma_util']:.1f}%",
-            f"{row['reduce_util']:.1f}%",
-            f"{row['exp2_util']:.1f}%",
-        ]
-        if has_case_names and has_case_descriptions:
-            row_cells.insert(0, _md_cell(row['description']))
-            row_cells.insert(0, _md_cell(row['name']))
-        elif has_case_names:
-            row_cells.insert(0, _md_cell(row['name']))
-        lines.append("| " + " | ".join(row_cells) + " |")
+    for title in case_order:
+        group_rows = cases_by_title[title]
+        lines.extend([
+            f"### {_md_cell(title)}",
+            "",
+            *summary_header,
+        ])
+        for row in group_rows:
+            row_cells = [
+                _md_cell(_benchmark_hardware_label(row)),
+                _md_cell(row['execution_mode']),
+                str(row['register_renaming']),
+                str(row['lanes']),
+                str(row['issue_width']),
+                str(row['cycles']),
+                f"{row['speedup']:.2f}x",
+                f"{row['issue_util']:.1f}%",
+                f"{row['load_util']:.1f}%",
+                f"{row['store_util']:.1f}%",
+                f"{row['fma_util']:.1f}%",
+                f"{row['reduce_util']:.1f}%",
+                f"{row['exp2_util']:.1f}%",
+            ]
+            lines.append("| " + " | ".join(row_cells) + " |")
+        lines.append("")
 
     lines.extend([
         "",
@@ -2183,72 +2295,25 @@ def run_benchmark_suite(args) -> str:
         "",
     ])
 
-    if has_case_names:
-        if has_case_descriptions:
-            lines.extend([
-                "| case | description | kernel | mode | rename | lanes | issue width | instructions | micro-ops |",
-                "|---|---|---|---|---|---:|---:|---:|---:|",
-            ])
-        else:
-            lines.extend([
-                "| case | kernel | mode | rename | lanes | issue width | instructions | micro-ops |",
-                "|---|---|---|---|---:|---:|---:|---:|",
-            ])
-    else:
+    for title in case_order:
+        group_rows = cases_by_title[title]
         lines.extend([
-            "| kernel | mode | rename | lanes | issue width | instructions | micro-ops |",
-            "|---|---|---|---:|---:|---:|---:|",
-        ])
-
-    for row in rows:
-        row_cells = [
-            _md_cell(row['kernel']),
-            _md_cell(row['execution_mode']),
-            str(row['register_renaming']),
-            str(row['lanes']),
-            str(row['issue_width']),
-            str(row['instruction_count']),
-            str(row['uop_count']),
-        ]
-        if has_case_names and has_case_descriptions:
-            row_cells.insert(0, _md_cell(row['description']))
-            row_cells.insert(0, _md_cell(row['name']))
-        elif has_case_names:
-            row_cells.insert(0, _md_cell(row['name']))
-        lines.append("| " + " | ".join(row_cells) + " |")
-
-    if has_case_notes:
-        lines.extend([
+            f"### {_md_cell(title)}",
             "",
-            "## Case Notes",
-            "",
+            *mix_header,
         ])
-        seen_notes = set()
-        for row in rows:
-            if not row['name']:
-                continue
-            if row['name'] in seen_notes:
-                continue
-            seen_notes.add(row['name'])
-            lines.append(f"- `{row['name']}`")
-            if row['description']:
-                lines.append(f"  - description: {row['description']}")
-            if row['parameter_notes']:
-                lines.append("  - parameters:")
-                notes = row['parameter_notes']
-                if isinstance(notes, dict):
-                    for key, value in notes.items():
-                        lines.append(f"    - {key}: {value}")
-                else:
-                    lines.append(f"    - {notes}")
-            if row['dependency_chain']:
-                lines.append(f"  - dependency chain: {row['dependency_chain']}")
-            if row['latency_diagram']:
-                lines.append("  - single-chain latency diagram:")
-                lines.append("    ```text")
-                for line in row['latency_diagram'].splitlines():
-                    lines.append(f"    {line}")
-                lines.append("    ```")
+        for row in group_rows:
+            row_cells = [
+                _md_cell(_benchmark_hardware_label(row)),
+                _md_cell(row['execution_mode']),
+                str(row['register_renaming']),
+                str(row['lanes']),
+                str(row['issue_width']),
+                str(row['instruction_count']),
+                str(row['uop_count']),
+            ]
+            lines.append("| " + " | ".join(row_cells) + " |")
+        lines.append("")
 
     return "\n".join(lines) + "\n"
 

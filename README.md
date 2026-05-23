@@ -160,6 +160,7 @@ The simulator tracks both:
 ### Benchmark YAML
 Benchmark YAML may include:
 - `defaults`: shared sweep knobs
+- `baseline`: hidden per-workload reference config used for baseline speedup normalization
 - `hardware_configs`: one or more hardware profiles to cross with the cases
 - `cases`: workload sweeps and metadata
 
