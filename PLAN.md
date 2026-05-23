@@ -1,14 +1,18 @@
-# RVV Multi-Lane TLP Extension Plan
+# AICPU SIMTD 向量执行机制实施计划
 
 ## Context
 
-在 RISC-V 向量处理器上，AI workload（softmax、rmsnorm、rope 等）存在大量独立的长依赖链计算任务。当前单 lane 执行时，发射槽利用率仅 31%，大量 cycle 浪费在等待依赖上。
+在 AICPU 研制过程中，tensorcore 可以提供较高的矩阵计算吞吐，但完整 AI kernel 仍然依赖向量单元完成 softmax、rmsnorm、silu、rope、量化/反量化、数据搬运和融合后处理等非矩阵计算。理论上，向量计算宽度已经能够覆盖这些操作的算力需求；但 workload 分析和微结构建模表明，现有向量单元在任务流组织、依赖隐藏、寄存器命名和访存/计算交错方面仍然存在瓶颈。
 
-本方案通过在 RVV ISA 中新增 **Multi-Lane** 机制，让一条向量指令自动广播到多个独立 lane（各拥有独立寄存器堆和记分牌），共享 decode 和执行单元，用最小硬件代价榨取 TLP。模拟显示 2 lane 即可提升 41% 性能。
+AI workload 的关键特征是“单任务链深、多任务独立”：单个 head/row/token 内部存在 reduce、exp、scale、rotate 等依赖链，但不同 head、row、token 或融合后处理片段之间存在规则 TLP。本计划将现有 Multi-Lane/VLane 机制定位为面向 AICPU 的 **SIMTD 向量执行机制**：由 ISA 和编译器显式暴露多个结构相同但数据独立的 task stream，由有限乱序向量单元通过 lane/context、scoreboard、有限窗口调度和必要的寄存器版本管理交错推进。
+
+本计划覆盖三个协同方向：微结构、ISA 体系结构和编译流程。短期目标是在 softmax_sim 与 QEMU 中验证 SIMTD 执行语义和性能动机；后续目标是在 Titan-I、Saturn 上推进实现，并与 tensorcore 工作结合进行 RTL/SoC 级仿真验证。
 
 ---
 
-## 1. ISA 规范（体系结构）
+## 1. SIMTD ISA 规范（体系结构）
+
+ISA 的目标是让编译器能够显式表达多个独立 task stream，而不是让硬件从普通指令流中复杂地推断并行性。第一版基于 RVV 做兼容扩展：标准 RVV 程序在 1 lane 下保持原有行为；开启多 lane 后，同一段向量 kernel 被映射到多个独立 lane/context 上执行。
 
 ### 1.1 vtype 扩展
 
@@ -19,7 +23,7 @@ vtype CSR 扩展:
 ```
 
 - vlane=0 时行为与标准 RVV 完全一致（向后兼容）
-- vlane>0 时，后续向量指令广播到 vlane 个 lane
+- vlane>0 时，后续向量指令广播到 vlane 个 lane/context
 
 ### 1.2 vlane stride CSR
 
@@ -70,6 +74,8 @@ vse16.l1.v v4, (a1)             # per-lane output (vlane1)
 ---
 
 ## 2. 微结构设计
+
+微结构目标是在 Saturn / Titan-I 这类有限乱序向量单元上消费已暴露的 AI workload TLP，而不是复制传统高性能 CPU 的大规模 SIMD OOO 后端。lane/context 表示独立 task stream；执行单元、访存单元和前端资源可以共享；每个 context 需要独立依赖跟踪和逻辑寄存器视图。第一版建模可以采用每 lane 独立 VRF，后续 RTL 可继续探索分银行 VRF、上下文映射或受限寄存器版本化。
 
 ### 2.1 整体结构
 
@@ -133,11 +139,11 @@ Arbiter                    可忽略
 
 ---
 
-## 3. ISA 模拟器（增强 softmax_sim）
+## 3. Workload/微结构模拟器（增强 softmax_sim）
 
 ### 3.1 目标
 
-在现有 softmax_simulator.py 基础上，增加 ISA 级建模，支持多 kernel 类型的微架构性能探索。
+在现有 softmax_simulator.py 基础上，建立面向 AICPU SIMTD 向量执行的 workload 和微结构模型。模拟器不是为了单独证明某一种 OOO 策略最优，而是用于刻画 softmax、rmsnorm、silu、rope 等 AI kernel 中的 TLP 如何被 lane/context、循环展开、逻辑寄存器预算、issue queue window、scheduler window 和重命名策略消费。
 
 ### 3.2 改动清单
 
@@ -170,7 +176,7 @@ Arbiter                    可忽略
 ### 3.3 验证
 
 - 各 kernel 单 lane 结果与已有 softmax 结果一致
-- 多 lane 性能提升数据（cycle、利用率）
+- 多 lane/SIMTD TLP 消费能力数据（cycle、利用率）
 - stride=0 时共享数据行为正确
 
 ---
@@ -179,7 +185,7 @@ Arbiter                    可忽略
 
 ### 4.1 基线
 
-基于 `/root/opencute/CUTE/cute-sdk/cuteqemu/`（T-Head 版本），已有 RVV 支持。
+基于 `/root/opencute/CUTE/cute-sdk/cuteqemu/`（T-Head 版本），已有 RVV 支持。QEMU 阶段主要验证 SIMTD ISA 语义、寄存器映射和 lane stride 地址计算的功能正确性，为后续 CUTE SDK kernel 改写和 RTL 实现提供软件闭环。
 
 ### 4.2 改动清单
 
@@ -224,11 +230,11 @@ Arbiter                    可忽略
 
 ---
 
-## 5. 编译器支持（LLVM/Clang）
+## 5. SIMTD 编译器支持（LLVM/Clang）
 
 ### 5.1 目标
 
-在 LLVM 的 RVV 后端中支持 `#pragma simt`，自动生成 vlane CSR 配置和带 vlane ctx 的 load/store。
+在 LLVM 的 RVV 后端中支持 `#pragma simt`，自动识别和表达 AI kernel 中的 head/row/token 级 TLP，生成 vlane CSR 配置和带 vlane ctx 的 load/store。第一阶段可以先用 intrinsic + 汇编宏快速验证，第二阶段再进入 LLVM pragma/pass。
 
 ### 5.2 实现步骤
 
@@ -287,12 +293,13 @@ Arbiter                    可忽略
 ## 6. 实施顺序
 
 ```
-阶段 0: ISA 规范文档
+阶段 0: 研究动机和 ISA 规范文档
   ↓
-阶段 1: softmax_sim 增强（微架构性能验证）
+阶段 1: softmax_sim 增强（workload + 微结构动机验证）
   ├── 新增 rmsnorm/rope/silu kernel 生成
   ├── lane stride 地址计算
-  └── 多 kernel 性能对比报告
+  ├── 循环展开和逻辑寄存器预算建模
+  └── 多 kernel cycle / 利用率 / TLP 消费能力报告
   ↓
 阶段 2: QEMU 功能模拟器
   ├── CSR 注册
@@ -308,7 +315,12 @@ Arbiter                    可忽略
 阶段 4: 端到端验证
   ├── CUTE SDK kernel 用 pragma 改写
   ├── 编译 → QEMU 运行 → 结果验证
-  └── 性能数据与 softmax_sim 交叉验证
+  └── 功能结果与 softmax_sim 建模交叉验证
+  ↓
+阶段 5: Titan-I / Saturn RTL 与 SoC 级验证
+  ├── 将 SIMTD lane/context 机制落到有限乱序向量单元
+  ├── 与 tensorcore 工作结合评估向量/张量协同
+  └── 在 RTL/SoC 仿真中验证端到端 AI kernel 吞吐
 ```
 
 ---

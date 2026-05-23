@@ -7,12 +7,12 @@
 # - metadata: documentation only; ignored by the simulator, preserved in the report
 #
 # Parameter meanings
-# - lanes -> num_contexts, i.e. how many independent lane contexts can run in parallel
-# - execution_mode -> in-order or out-of-order issue scheduling
+# - lanes -> num_contexts, i.e. how many independent SIMTD task streams can run in parallel
+# - execution_mode -> in-order or out-of-order issue scheduling; used to study how visible task streams are consumed
 # - register_renaming -> true lets independent heads/rows reuse logical registers without false hazards
 # - loop_unroll -> compiler-level software unroll; true expands to the maximum head/row count that fits logical_register_count
 # - logical_register_count -> logical vector register budget per context; unrolled heads/rows get distinct logical-register banks
-# - issue_queue_window -> oldest not-yet-completed uops visible to both schedulers
+# - issue_queue_window -> oldest not-yet-completed uops visible to the hardware scheduler
 # - ooo_scheduler_window_size -> oldest not-yet-issued uops the out-of-order scheduler can choose from inside the issue queue window
 # - issue_width -> max uops issued per cycle across all active lanes
 # - lane_stride_0..3 -> vlane0..vlane3 byte strides; 0 means shared data
@@ -49,7 +49,14 @@
 # - REDUCE is shown as 14 cycles for register_width=2048 and reduce width=512:
 #   4 first-level reduce uops plus 1 final reduce uop, each with 7-cycle latency.
 # - Full benchmark cycles can be larger/smaller because the simulator also models uop splitting,
-#   issue_width, shared execution-unit bandwidth, chaining, and multi-lane interleaving.
+#   issue_width, shared execution-unit bandwidth, chaining, loop unroll, and multi-lane interleaving.
+#
+# Report interpretation
+# - The benchmark is a motivation and design-space model for AICPU SIMTD vector execution.
+# - OOO, rename, windows, issue width, lanes, and unroll are hardware/compiler knobs for
+#   measuring how AI workload TLP can be exposed and consumed; they are not separate research goals.
+# - Rows inside each case are sorted by cycle count from high to low so the report can show
+#   where the SIMTD design-space still leaves room for improvement on the target workload.
 #
 # Per-instruction tables are easier to read as CSV. See:
 # plans/benchmark_instruction_table.example.csv
@@ -156,7 +163,7 @@ cases:
     num_heads: 128
     seq_chunk_bits: 2048
     metadata:
-      description: Softmax using a six-FMA polynomial approximation for exp2 when no dedicated EXP2 unit is available.
+      description: Softmax using a six-FMA polynomial approximation for exp2 when no dedicated EXP2 unit is available. This case is used to expose deep head-level TLP and motivate SIMTD interleaving on AICPU.
       lane_mapping: lanes becomes num_contexts; each lane is one independently runnable head context.
       dependency_chain: LOAD(input) -> REDUCE(max) -> LOAD(subtract) -> FMA(poly1) -> FMA(poly2) -> FMA(poly3) -> FMA(poly4) -> FMA(poly5) -> FMA(poly6) -> REDUCE(sum) + STORE(exp scratch) -> LOAD(exp scratch) -> FMA(div) -> STORE(output)
       latency_diagram: |
@@ -198,7 +205,7 @@ cases:
     num_heads: 128
     seq_chunk_bits: 2048
     metadata:
-      description: Softmax using a dedicated EXP2 unit; EXP2 replaces the six dependent FMA polynomial stages.
+      description: Softmax using a dedicated EXP2 unit; EXP2 replaces the six dependent FMA polynomial stages. This case shows how shortening the chain changes the value of SIMTD scheduling.
       lane_mapping: lanes becomes num_contexts; each lane is one independently runnable head context.
       dependency_chain: LOAD(input) -> REDUCE(max) -> LOAD(subtract) -> EXP2 -> REDUCE(sum) + STORE(exp scratch) -> LOAD(exp scratch) -> FMA(div) -> STORE(output)
       latency_diagram: |
@@ -233,7 +240,7 @@ cases:
     kernel: rmsnorm
     num_rows: 128
     metadata:
-      description: RMSNorm is modeled as per-row input, reduction, rescale, shared weight load, and output store.
+      description: RMSNorm is modeled as per-row input, reduction, rescale, shared weight load, and output store. This case highlights row-level TLP and shared-parameter access.
       lane_mapping: each lane is one independently runnable row.
       dependency_chain: LOAD(input) -> FMA(square) -> REDUCE(sum) -> FMA(scale) -> LOAD(weight shared) -> FMA(mul) -> STORE(output)
       latency_diagram: |
@@ -262,7 +269,7 @@ cases:
     exp2_unit: false
     num_rows: 128
     metadata:
-      description: SiLU using a six-FMA polynomial approximation for the exponent stage.
+      description: SiLU using a six-FMA polynomial approximation for the exponent stage. This case highlights a long fused post-processing chain that benefits from SIMTD task interleaving.
       lane_mapping: each lane is one independently runnable row.
       dependency_chain: LOAD(input) -> FMA(negate) -> FMA(poly1) -> FMA(poly2) -> FMA(poly3) -> FMA(poly4) -> FMA(poly5) -> FMA(poly6) -> FMA(add1) -> FMA(div/mul) -> STORE(output)
       latency_diagram: |
@@ -296,7 +303,7 @@ cases:
     exp2_unit: true
     num_rows: 128
     metadata:
-      description: SiLU using a dedicated EXP2 unit; EXP2 replaces the six dependent FMA polynomial stages.
+      description: SiLU using a dedicated EXP2 unit; EXP2 replaces the six dependent FMA polynomial stages. This case isolates the effect of a shorter dependency chain on SIMTD usefulness.
       lane_mapping: each lane is one independently runnable row.
       dependency_chain: LOAD(input) -> FMA(negate) -> EXP2 -> FMA(add1) -> FMA(div/mul) -> STORE(output)
       latency_diagram: |
@@ -324,7 +331,7 @@ cases:
     kernel: rope
     num_rows: 128
     metadata:
-      description: RoPE mixes shared theta data with per-row input and output streams.
+      description: RoPE mixes shared theta data with per-row input and output streams. This case highlights token/position-block level parallelism in the AICPU setting.
       lane_mapping: each lane is one independently runnable row or position block.
       dependency_chain: LOAD(theta shared) -> FMA(angle) -> LOAD(input) -> FMA(real/imag) -> STORE(output)
       latency_diagram: |
